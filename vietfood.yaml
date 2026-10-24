@@ -1,0 +1,23 @@
+# YOLOv8 Dataset Configuration for Vietnamese Street Food (14 Classes)
+path: /app/dataset
+train: train/images
+val: valid/images
+test: test/images
+
+nc: 14
+
+names:
+  0: BANH_CUON           # Bánh Cuốn Nóng
+  1: BANH_GIO            # Bánh Giò
+  2: BANH_MI             # Bánh Mì Kẹp Thịt Nướng
+  3: BUN_BO_HUE          # Bún Bò Huế
+  4: BUN_CHA_HA_NOI      # Bún Chả Hà Nội
+  5: BUN_DAU_MAM_TOM     # Bún Đậu Mắm Tôm
+  6: BUN_THIT_NUONG      # Bún Thịt Nướng
+  7: CHAO_LONG           # Cháo Lòng
+  8: COM_DEP             # Cốm Dẹp
+  9: BROKEN_RICE         # Cơm Tấm
+  10: COM_RANG           # Cơm Rang
+  11: BEEF_PHO           # Phở Bò
+  12: GOI_CUON           # Gỏi Cuốn
+  13: XOI                # Xôi
