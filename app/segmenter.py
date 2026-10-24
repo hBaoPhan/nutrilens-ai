@@ -110,7 +110,8 @@ class FoodSegmentationEngine:
                 if img is None:
                     return []
 
-                results = self.model(img, conf=0.25)[0]
+                conf_threshold = float(os.getenv("YOLO_CONF_THRESHOLD", "0.40"))
+                results = self.model(img, conf=conf_threshold)[0]
                 items = []
 
                 if results.boxes is not None and len(results.boxes) > 0:
@@ -145,8 +146,9 @@ class FoodSegmentationEngine:
                             boundingBox=bbox
                         ))
 
-                # If primary YOLO food classes returned 0 items, check for atomic ingredients (e.g. Eggs)
-                if len(items) == 0:
+                # Fallback to atomic ingredients (disabled by default to prevent false positives like auto-egg detection)
+                enable_atomic_fallback = os.getenv("ENABLE_ATOMIC_FALLBACK", "false").lower() == "true"
+                if len(items) == 0 and enable_atomic_fallback:
                     items = self._detect_atomic_ingredients(img)
 
                 # Return true detected items (or empty list if no food detected)
