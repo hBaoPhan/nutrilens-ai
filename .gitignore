@@ -1,0 +1,28 @@
+# Byte-compiled / cache files
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+
+# Môi trường ảo
+.venv/
+venv/
+env/
+
+# Dữ liệu & Kết quả huấn luyện YOLO
+dataset/
+runs/
+
+# Trọng số mô hình (Weights & Checkpoints)
+weights/
+*.pt
+*.pth
+*.onnx
+*.engine
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints/
+
+# IDE & Editor
+.vscode/
+.idea/
