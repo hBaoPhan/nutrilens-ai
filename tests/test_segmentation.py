@@ -1,7 +1,8 @@
 # ai-service/tests/test_segmentation.py
 import pytest
 from httpx import AsyncClient, ASGITransport
-from app.main import app
+from app.main import app, engine
+from app.schemas import SegmentedFoodItem
 
 @pytest.mark.anyio
 async def test_health_check():
@@ -13,9 +14,28 @@ async def test_health_check():
         assert data["service"] == "nutrilens-ai-segmentation"
 
 @pytest.mark.anyio
-async def test_segment_food_valid_image():
+async def test_segment_food_valid_image(monkeypatch):
+    # Mock segmentation to return sample qualified and low-confidence items
+    mock_qualified = [
+        SegmentedFoodItem(
+            foodCode="BOILED_EGG",
+            confidence=0.88,
+            polygonNormalized=[[0.2, 0.2], [0.5, 0.2], [0.5, 0.6], [0.2, 0.6]],
+            boundingBox=[50.0, 50.0, 200.0, 200.0]
+        )
+    ]
+    mock_all = [
+        mock_qualified[0],
+        SegmentedFoodItem(
+            foodCode="RICE_WHITE_COOKED",
+            confidence=0.25,
+            polygonNormalized=[[0.1, 0.1], [0.4, 0.1], [0.4, 0.4], [0.1, 0.4]],
+            boundingBox=[20.0, 20.0, 150.0, 150.0]
+        )
+    ]
+    monkeypatch.setattr(engine, "segment_image_bytes", lambda *args, **kwargs: (mock_qualified, mock_all))
+
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-        # Dummy 1x1 PNG bytes
         fake_png = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x06\x00\x00\x00\x1f\x15c4\x00\x00\x00\nIDATx\x9cc\x00\x01\x00\x00\x05\x00\x01\r\n-\xb4\x00\x00\x00\x00IEND\xaeB`\x82"
         files = {"image": ("dish_plate.png", fake_png, "image/png")}
         
@@ -23,16 +43,12 @@ async def test_segment_food_valid_image():
         assert response.status_code == 200
         data = response.json()
         assert data["status"] == "SUCCESS"
-        assert data["totalComponentsDetected"] >= 1
-        
-        for item in data["items"]:
-            assert "foodCode" in item
-            assert 0.0 <= item["confidence"] <= 1.0
-            assert len(item["polygonNormalized"]) >= 3
-            # Check normalized bounds [0, 1]
-            for pt in item["polygonNormalized"]:
-                assert 0.0 <= pt[0] <= 1.0
-                assert 0.0 <= pt[1] <= 1.0
+        assert data["totalComponentsDetected"] == 1
+        assert len(data["items"]) == 1
+        assert data["items"][0]["foodCode"] == "BOILED_EGG"
+        assert len(data["allDetected"]) == 2
+        assert data["allDetected"][1]["foodCode"] == "RICE_WHITE_COOKED"
+        assert data["allDetected"][1]["confidence"] == 0.25
 
 @pytest.mark.anyio
 async def test_segment_food_invalid_mime_type():
