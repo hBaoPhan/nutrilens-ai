@@ -3,7 +3,7 @@ import os
 import time
 import logging
 from datetime import datetime
-from typing import Optional
+from typing import Optional, List
 from fastapi import FastAPI, UploadFile, File, HTTPException, Query, status
 from fastapi.responses import FileResponse
 from app.schemas import SegmentationResponse
@@ -19,23 +19,153 @@ logger = logging.getLogger("nutrilens-ai")
 
 app = FastAPI(
     title="AR NutriLens - Food Segmentation Microservice",
-    description="Instance segmentation pipeline with in-depth image diagnostics & orientation recovery",
-    version="1.0.0"
+    description="Instance segmentation pipeline with in-depth image diagnostics, auto-orientation & debug capture exports",
+    version="1.1.0"
 )
 
 default_weights = "weights/yolov8_vietfood_seg.pt" if os.path.exists("weights/yolov8_vietfood_seg.pt") else "yolov8n-seg.pt"
 weights_path = os.getenv("MODEL_WEIGHTS_PATH", default_weights)
 engine = FoodSegmentationEngine(weights_path=weights_path)
 
-# Debug captures directories
-DEBUG_CAPTURES_DIR = "debug_captures"
-os.makedirs(DEBUG_CAPTURES_DIR, exist_ok=True)
-
+# Brain Artifact directory for Markdown embedding
 ARTIFACT_DIR = r"C:\Users\baoph\.gemini\antigravity\brain\fd8f0d58-fe89-4a9f-a991-bf55be9f40a3\unity_captures"
-os.makedirs(ARTIFACT_DIR, exist_ok=True)
 
 # Cache last diagnostic info in memory for instant inspection
 last_diagnostic_cache = {}
+
+
+def get_debug_capture_dirs() -> List[str]:
+    """
+    Returns all valid target directories for saving debug captures.
+    Guarantees saving to both root debug_captures and ai-service/debug_captures
+    whether running inside Docker or directly on the host machine.
+    """
+    base_dir = os.path.dirname(os.path.abspath(__file__))  # /app/app or .../ai-service/app
+    candidates = [
+        # Inside Docker mount points
+        "/app/debug_captures",
+        "/app/ai_debug_captures",
+        # Local development relative paths
+        os.path.abspath("debug_captures"),
+        os.path.abspath("ai-service/debug_captures"),
+        os.path.abspath(os.path.join(base_dir, "..", "debug_captures")),
+        os.path.abspath(os.path.join(base_dir, "..", "..", "debug_captures")),
+        # Conversation Artifact directory
+        ARTIFACT_DIR
+    ]
+    valid_dirs = []
+    seen = set()
+    for d in candidates:
+        if d and d not in seen:
+            seen.add(d)
+            try:
+                os.makedirs(d, exist_ok=True)
+                if os.path.isdir(d) and os.access(d, os.W_OK):
+                    valid_dirs.append(d)
+            except Exception:
+                pass
+    return valid_dirs
+
+
+def save_raw_debug_captures(content: bytes, timestamp_str: str) -> List[str]:
+    """Saves raw incoming JPEG bytes to all debug directories."""
+    saved_paths = []
+    for d in get_debug_capture_dirs():
+        p_ts = os.path.join(d, f"capture_{timestamp_str}.jpg")
+        p_last = os.path.join(d, "last_unity_capture.jpg")
+        for p in [p_ts, p_last]:
+            try:
+                with open(p, "wb") as f:
+                    f.write(content)
+                saved_paths.append(p)
+            except Exception as e:
+                logger.debug(f"Failed to write raw capture to {p}: {e}")
+    return saved_paths
+
+
+def draw_prediction_overlay(cv_img, all_detected, conf_threshold: float):
+    """
+    Draws bounding boxes, polygon masks, and confidence badges onto the image
+    for instant visual inspection in debug_captures.
+    """
+    import cv2
+    import numpy as np
+
+    annotated = cv_img.copy()
+    h, w = annotated.shape[:2]
+    mask_layer = annotated.copy()
+
+    # Distinguishable color palette (BGR)
+    palette = [
+        (46, 204, 113),   # Emerald Green
+        (52, 152, 219),   # Sky Blue
+        (155, 89, 182),   # Amethyst Purple
+        (241, 196, 15),   # Sun Yellow
+        (230, 126, 34),   # Orange
+        (231, 76, 60),    # Coral Red
+        (26, 188, 156),   # Turquoise
+        (243, 156, 18)    # Amber
+    ]
+
+    has_mask = False
+    for idx, it in enumerate(all_detected):
+        color = palette[idx % len(palette)]
+        is_qualified = it.confidence >= conf_threshold
+
+        # 1. Fill polygon segmentation mask if present
+        if it.polygonNormalized and len(it.polygonNormalized) >= 3:
+            pts = np.array([[int(p[0] * w), int(p[1] * h)] for p in it.polygonNormalized], np.int32)
+            cv2.fillPoly(mask_layer, [pts], color)
+            has_mask = True
+
+        # 2. Draw bounding box rectangle
+        if it.boundingBox and len(it.boundingBox) == 4:
+            x1, y1, x2, y2 = [int(v) for v in it.boundingBox]
+            box_color = color if is_qualified else (120, 120, 120)
+            thickness = 2 if is_qualified else 1
+            cv2.rectangle(annotated, (x1, y1), (x2, y2), box_color, thickness)
+
+            # 3. Label text pill badge
+            conf_pct = it.confidence * 100.0
+            label = f"{it.foodCode} {conf_pct:.1f}%"
+            font_scale = 0.52
+            (tw, th), baseline = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, font_scale, 1)
+
+            badge_y1 = max(0, y1 - th - 8)
+            badge_y2 = y1
+            badge_x2 = min(w, x1 + tw + 10)
+
+            # Draw background badge rectangle
+            cv2.rectangle(annotated, (x1, badge_y1), (badge_x2, badge_y2), box_color, -1)
+            text_color = (0, 0, 0) if is_qualified else (255, 255, 255)
+            cv2.putText(
+                annotated, label,
+                (x1 + 4, badge_y2 - 5),
+                cv2.FONT_HERSHEY_SIMPLEX, font_scale, text_color, 1, cv2.LINE_AA
+            )
+
+    # Blend semi-transparent segmentation masks
+    if has_mask:
+        cv2.addWeighted(mask_layer, 0.35, annotated, 0.65, 0, annotated)
+
+    return annotated
+
+
+def save_prediction_debug_captures(annotated_img, timestamp_str: str) -> List[str]:
+    """Encodes and saves annotated prediction image to all debug directories."""
+    import cv2
+    saved_paths = []
+    for d in get_debug_capture_dirs():
+        p_ts = os.path.join(d, f"pred_{timestamp_str}.jpg")
+        p_last = os.path.join(d, "last_unity_prediction.jpg")
+        for p in [p_ts, p_last]:
+            try:
+                cv2.imwrite(p, annotated_img, [cv2.IMWRITE_JPEG_QUALITY, 90])
+                saved_paths.append(p)
+            except Exception as e:
+                logger.debug(f"Failed to write prediction image to {p}: {e}")
+    return saved_paths
+
 
 @app.get("/health", status_code=status.HTTP_200_OK)
 async def health_check():
@@ -44,21 +174,35 @@ async def health_check():
         "status": "HEALTHY",
         "service": "nutrilens-ai-segmentation",
         "modelLoaded": model_loaded,
-        "weights": engine.weights_path
+        "weights": engine.weights_path,
+        "debugCaptureDirs": get_debug_capture_dirs()
     }
+
 
 @app.get("/api/v1/vision/last-capture", status_code=status.HTTP_200_OK)
 async def get_last_capture():
-    last_file = os.path.join(DEBUG_CAPTURES_DIR, "last_unity_capture.jpg")
-    if not os.path.exists(last_file):
-        raise HTTPException(status_code=404, detail="No capture received yet from Unity client")
-    return FileResponse(last_file, media_type="image/jpeg")
+    for d in get_debug_capture_dirs():
+        last_file = os.path.join(d, "last_unity_capture.jpg")
+        if os.path.exists(last_file):
+            return FileResponse(last_file, media_type="image/jpeg")
+    raise HTTPException(status_code=404, detail="No capture received yet from Unity client")
+
+
+@app.get("/api/v1/vision/last-prediction", status_code=status.HTTP_200_OK)
+async def get_last_prediction():
+    for d in get_debug_capture_dirs():
+        last_file = os.path.join(d, "last_unity_prediction.jpg")
+        if os.path.exists(last_file):
+            return FileResponse(last_file, media_type="image/jpeg")
+    raise HTTPException(status_code=404, detail="No prediction image generated yet")
+
 
 @app.get("/api/v1/vision/diagnose-last", status_code=status.HTTP_200_OK)
 async def get_last_diagnostic():
     if not last_diagnostic_cache:
         raise HTTPException(status_code=404, detail="No capture diagnostic available yet")
     return last_diagnostic_cache
+
 
 @app.post("/api/v1/vision/segment", response_model=SegmentationResponse, status_code=status.HTTP_200_OK)
 async def segment_food(
@@ -91,27 +235,13 @@ async def segment_food(
 
     size_kb = len(content) / 1024.0
 
-    # 1. SAVE RAW IMAGE FOR DIRECT VISUAL INSPECTION
-    saved_paths = []
-    try:
-        # Save to local debug folder
-        p1 = os.path.join(DEBUG_CAPTURES_DIR, "last_unity_capture.jpg")
-        p2 = os.path.join(DEBUG_CAPTURES_DIR, f"capture_{timestamp_str}.jpg")
-        with open(p1, "wb") as f: f.write(content)
-        with open(p2, "wb") as f: f.write(content)
-        saved_paths.extend([p1, p2])
-
-        # Save to Artifact directory for direct Markdown embedding
-        if os.path.exists(ARTIFACT_DIR):
-            art_last = os.path.join(ARTIFACT_DIR, "last_unity_capture.jpg")
-            art_ts = os.path.join(ARTIFACT_DIR, f"capture_{timestamp_str}.jpg")
-            with open(art_last, "wb") as f: f.write(content)
-            with open(art_ts, "wb") as f: f.write(content)
-            saved_paths.extend([art_last, art_ts])
-    except Exception as save_ex:
-        logger.warning(f"Could not persist debug snapshot: {save_ex}")
+    # 1. SAVE RAW IMAGE IMMEDIATELY TO DEBUG_CAPTURES FOLDERS
+    saved_raw = save_raw_debug_captures(content, timestamp_str)
+    if saved_raw:
+        logger.info(f"💾 Raw capture saved ({size_kb:.1f} KB): {os.path.basename(saved_raw[0])} -> {len(saved_raw)} locations")
 
     # 2. RUN IN-DEPTH COMPUTER VISION DIAGNOSTIC ON CAPTURED FRAME
+    cv_img = None
     try:
         import cv2
         import numpy as np
@@ -183,7 +313,7 @@ async def segment_food(
     except Exception as diag_ex:
         logger.warning(f"Diagnostic error: {diag_ex}")
 
-    # 3. PERFORM STANDARD SEGMENTATION & RESPONSE
+    # 3. PERFORM STANDARD SEGMENTATION & INFERENCE
     default_conf_thresh = float(os.getenv("YOLO_CONF_THRESHOLD", "0.40"))
     effective_conf_thresh = min_conf if min_conf is not None else default_conf_thresh
     scan_min_conf = float(os.getenv("YOLO_SCAN_MIN_CONF", "0.01"))
@@ -217,6 +347,16 @@ async def segment_food(
                 f"   [#{idx:02d}] {status_tag} FoodCode: {it.foodCode:<22} | "
                 f"Conf: {it.confidence * 100:5.1f}% | BBox: {it.boundingBox} | Mask: {mask_pts} pts"
             )
+
+    # 4. GENERATE AND SAVE ANNOTATED VISUAL PREDICTION OVERLAY
+    if cv_img is not None:
+        try:
+            annotated_img = draw_prediction_overlay(cv_img, all_detected, effective_conf_thresh)
+            saved_pred = save_prediction_debug_captures(annotated_img, timestamp_str)
+            if saved_pred:
+                logger.info(f"🎨 Visual prediction overlay saved: pred_{timestamp_str}.jpg -> {len(saved_pred)} locations")
+        except Exception as draw_ex:
+            logger.warning(f"Could not generate prediction overlay image: {draw_ex}")
 
     output_items = all_detected if include_all else qualified_items
 

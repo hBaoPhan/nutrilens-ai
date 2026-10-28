@@ -9,10 +9,10 @@ import torch
 from ultralytics import YOLO
 
 def train_segmentation(
-    data_yaml="vietfood_seg.yaml",
-    epochs=100,
+    data_yaml="dataset/data.yaml",
+    epochs=80,
     imgsz=640,
-    base_model="yolov8n-seg.pt",
+    base_model="yolov8s-seg.pt",
     batch=8,
     device=None
 ):
@@ -71,11 +71,11 @@ def train_segmentation(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train YOLOv8 Instance Segmentation on Vietnamese food")
-    parser.add_argument("--data", default="vietfood_seg.yaml", help="Path to segmentation data yaml")
-    parser.add_argument("--epochs", type=int, default=100, help="Number of training epochs (default: 100)")
+    parser.add_argument("--data", default="dataset/data.yaml", help="Path to segmentation data yaml")
+    parser.add_argument("--epochs", type=int, default=80, help="Number of training epochs (default: 80)")
     parser.add_argument("--imgsz", type=int, default=640, help="Image resolution (default: 640)")
     parser.add_argument("--batch", type=int, default=8, help="Batch size (default: 8 for 4GB VRAM)")
-    parser.add_argument("--model", default="yolov8n-seg.pt", help="Pretrained base model (default: yolov8n-seg.pt)")
+    parser.add_argument("--model", default="yolov8s-seg.pt", help="Pretrained base model (default: yolov8s-seg.pt)")
     parser.add_argument("--device", default=None, help="Device to use: 0, 1, 'cpu' (default: auto)")
     
     args = parser.parse_args()
