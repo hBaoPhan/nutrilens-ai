@@ -6,8 +6,13 @@ from datetime import datetime
 from typing import Optional, List
 from fastapi import FastAPI, UploadFile, File, HTTPException, Query, status
 from fastapi.responses import FileResponse
-from app.schemas import SegmentationResponse
+from app.schemas import (
+    SegmentationResponse,
+    RAGRecommendationRequest,
+    RAGRecommendationResponse
+)
 from app.segmenter import FoodSegmentationEngine
+from app.rag_recommender import recommender
 
 # Configure structured logging for AI Service
 logging.basicConfig(
@@ -366,3 +371,24 @@ async def segment_food(
         items=output_items,
         allDetected=all_detected
     )
+
+
+@app.post(
+    "/api/v1/recommendations/rag-suggest",
+    response_model=RAGRecommendationResponse,
+    status_code=status.HTTP_200_OK,
+    summary="AI RAG Meal Recommendation Engine"
+)
+async def suggest_meal_rag(request: RAGRecommendationRequest):
+    logger.info(
+        f"🤖 Incoming RAG recommendation request for user '{request.userContext.username}' "
+        f"| Goal: {request.userContext.fitnessGoal} | Next Meal: {request.userContext.targetMealType} "
+        f"| Remaining Kcal: {request.userContext.remainingKcalToday:.0f} "
+        f"| Candidates: {len(request.candidateFoods)}"
+    )
+    result = recommender.recommend_next_meal(request)
+    logger.info(
+        f"🎯 RAG recommendation completed [{result.modelSource}]: "
+        f"{len(result.recommendedDishes)} dishes selected | Top: {result.recommendedDishes[0].displayName if result.recommendedDishes else 'None'}"
+    )
+    return result

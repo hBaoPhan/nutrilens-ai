@@ -26,3 +26,5 @@ weights/
 # IDE & Editor
 .vscode/
 .idea/
+
+debug_captures/
