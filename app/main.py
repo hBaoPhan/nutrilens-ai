@@ -113,9 +113,17 @@ def draw_prediction_overlay(cv_img, all_detected, conf_threshold: float):
     ]
 
     has_mask = False
+    total_class_counts = {}
+    for it in all_detected:
+        total_class_counts[it.foodCode] = total_class_counts.get(it.foodCode, 0) + 1
+    class_instance_counters = {}
+
     for idx, it in enumerate(all_detected):
         color = palette[idx % len(palette)]
         is_qualified = it.confidence >= conf_threshold
+        class_instance_counters[it.foodCode] = class_instance_counters.get(it.foodCode, 0) + 1
+        inst_idx = class_instance_counters[it.foodCode]
+        total_inst = total_class_counts[it.foodCode]
 
         # 1. Fill polygon segmentation mask if present
         if it.polygonNormalized and len(it.polygonNormalized) >= 3:
@@ -130,9 +138,12 @@ def draw_prediction_overlay(cv_img, all_detected, conf_threshold: float):
             thickness = 2 if is_qualified else 1
             cv2.rectangle(annotated, (x1, y1), (x2, y2), box_color, thickness)
 
-            # 3. Label text pill badge
+            # 3. Label text pill badge with multi-instance numbering (e.g. BOILED_EGG #1/2)
             conf_pct = it.confidence * 100.0
-            label = f"{it.foodCode} {conf_pct:.1f}%"
+            if total_inst > 1:
+                label = f"{it.foodCode} #{inst_idx}/{total_inst} {conf_pct:.1f}%"
+            else:
+                label = f"{it.foodCode} {conf_pct:.1f}%"
             font_scale = 0.52
             (tw, th), baseline = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, font_scale, 1)
 
@@ -365,9 +376,18 @@ async def segment_food(
 
     output_items = all_detected if include_all else qualified_items
 
+    # Compute instance summary counts (e.g. {"BOILED_EGG": 2})
+    item_counts = {}
+    for it in output_items:
+        item_counts[it.foodCode] = item_counts.get(it.foodCode, 0) + 1
+
+    if item_counts:
+        logger.info(f"📊 Instance Summary Counts: {item_counts}")
+
     return SegmentationResponse(
         status="SUCCESS",
         totalComponentsDetected=len(output_items),
+        itemCounts=item_counts,
         items=output_items,
         allDetected=all_detected
     )

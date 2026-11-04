@@ -15,6 +15,10 @@ class SegmentedFoodItem(BaseModel):
 class SegmentationResponse(BaseModel):
     status: str = Field("SUCCESS", description="Operation status")
     totalComponentsDetected: int = Field(..., ge=0)
+    itemCounts: Optional[dict] = Field(
+        default_factory=dict,
+        description="Summary counts of detected instances per food code, e.g. {'BOILED_EGG': 2}"
+    )
     items: List[SegmentedFoodItem]
     allDetected: Optional[List[SegmentedFoodItem]] = Field(
         default=None,
