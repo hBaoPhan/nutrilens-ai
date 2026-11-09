@@ -6,25 +6,32 @@ from app.schemas import SegmentedFoodItem
 
 # Mapping detected object/food classes to standardized NutriLens food codes
 FOOD_MAPPING = {
-    # COCO Fruits & Foods
+    # COCO & Fruit Classes
     "APPLE": "APPLE",
     "BANANA": "BANANA",
     "ORANGE": "ORANGE",
+    "COCONUT": "COCONUT",
+    "WATERMELON": "WATERMELON",
+    "SUA_CHUA": "SUA_CHUA",
+    "YOGURT": "SUA_CHUA",
+    "GREEK_YOGURT": "SUA_CHUA",
     "BROCCOLI": "BROCCOLI",
     "CARROT": "CARROT",
     "SANDWICH": "AVOCADO_TOAST",
     "PIZZA": "PIZZA",
     "HOT DOG": "PORK_GRILLED_RIB",
-    "CAKE": "GREEK_YOGURT",
-    "DONUT": "GREEK_YOGURT",
+    "CAKE": "SUA_CHUA",
+    "DONUT": "SUA_CHUA",
     "BOWL": "RICE_WHITE_COOKED",
-    "CUP": "GREEK_YOGURT",
+    "CUP": "SUA_CHUA",
     
-    # Custom Vietnamese Food Classes
+    # Pure Vietnamese Food Classes (Thuần Việt)
+    "PHO_BO": "PHO_BO",
+    "BEEF_PHO": "PHO_BO",
+    "COM_TAM": "COM_TAM",
+    "BROKEN_RICE": "COM_TAM",
     "RICE_WHITE_COOKED": "RICE_WHITE_COOKED",
-    "BROKEN_RICE": "BROKEN_RICE",
     "PORK_GRILLED_RIB": "PORK_GRILLED_RIB",
-    "BEEF_PHO": "BEEF_PHO",
     "BUN_CHA_HA_NOI": "BUN_CHA_HA_NOI",
     "BANH_CUON": "BANH_CUON",
     "BANH_GIO": "BANH_GIO",
@@ -67,9 +74,11 @@ FOOD_MAPPING = {
     "GRILLED PORK VERMICELLI": "BUN_THIT_NUONG",
     "PORK OFFAL PORRIDGE": "CHAO_LONG",
     "FLATTENED GREEN RICE": "COM_DEP",
-    "BROKEN RICE": "BROKEN_RICE",
+    "BROKEN RICE": "COM_TAM",
+    "COM TAM": "COM_TAM",
     "FRIED RICE": "COM_RANG",
-    "BEEF PHO": "BEEF_PHO",
+    "BEEF PHO": "PHO_BO",
+    "PHO BO": "PHO_BO",
     "SPRING ROLLS": "GOI_CUON",
     "STICKY RICE": "XOI"
 }
