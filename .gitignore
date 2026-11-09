@@ -27,4 +27,11 @@ weights/
 .vscode/
 .idea/
 
+# Debug captures & Test directories
 debug_captures/
+debug_capture/
+debug_capture*/
+*debug_capture*/
+tests/
+test/
+test_*/
