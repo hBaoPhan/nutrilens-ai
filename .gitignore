@@ -35,3 +35,23 @@ debug_capture*/
 tests/
 test/
 test_*/
+
+# Secrets & Environment files
+.env
+*.env
+.env.*
+
+# Data preparation, augmentation & training notebooks
+augment_atomic_ingredients.py
+fetch_real_atomic_datasets.py
+package_dataset.py
+train_colab_vietfood_seg.ipynb
+*.ipynb
+dataset.zip
+*.zip
+
+# Image captures & debug outputs
+last_unity_capture.jpg
+*.jpg
+*.jpeg
+*.png
