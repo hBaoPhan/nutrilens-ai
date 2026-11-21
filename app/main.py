@@ -4,15 +4,20 @@ import time
 import logging
 from datetime import datetime
 from typing import Optional, List
-from fastapi import FastAPI, UploadFile, File, HTTPException, Query, status
-from fastapi.responses import FileResponse
+from fastapi import FastAPI, UploadFile, File, HTTPException, Query, Header, status
+from fastapi.responses import FileResponse, StreamingResponse
 from app.schemas import (
     SegmentationResponse,
     RAGRecommendationRequest,
-    RAGRecommendationResponse
+    RAGRecommendationResponse,
+    ChatRequest,
+    ChatResponse,
+    ChatHistoryItem,
+    ChatHistoryResponse
 )
 from app.segmenter import FoodSegmentationEngine
 from app.rag_recommender import recommender
+from app.chatbot.rag_engine import chatbot_engine
 
 # Configure structured logging for AI Service
 logging.basicConfig(
@@ -412,3 +417,84 @@ async def suggest_meal_rag(request: RAGRecommendationRequest):
         f"{len(result.recommendedDishes)} dishes selected | Top: {result.recommendedDishes[0].displayName if result.recommendedDishes else 'None'}"
     )
     return result
+
+
+# ==============================================================================
+# RAG Chatbot Endpoints
+# ==============================================================================
+
+@app.post(
+    "/api/v1/chatbot/chat",
+    response_model=ChatResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Personalized Clinical Nutrition RAG Chatbot"
+)
+async def chat_with_bot(
+    request: ChatRequest,
+    x_user_username: Optional[str] = Header(None, alias="X-User-Username")
+):
+    username = x_user_username or "user"
+    return await chatbot_engine.chat(
+        query=request.message,
+        username=username,
+        conversation_id=request.conversationId
+    )
+
+
+@app.post(
+    "/api/v1/chatbot/chat/stream",
+    summary="Personalized Clinical Nutrition RAG Chatbot (SSE Streaming)"
+)
+async def chat_with_bot_stream(
+    request: ChatRequest,
+    x_user_username: Optional[str] = Header(None, alias="X-User-Username")
+):
+    username = x_user_username or "user"
+    return StreamingResponse(
+        chatbot_engine.chat_stream(
+            query=request.message,
+            username=username,
+            conversation_id=request.conversationId
+        ),
+        media_type="text/event-stream"
+    )
+
+
+@app.get(
+    "/api/v1/chatbot/history",
+    response_model=ChatHistoryResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Get multi-turn conversation memory history"
+)
+async def get_chat_history(
+    conversationId: str = Query(..., description="Conversation UUID"),
+    x_user_username: Optional[str] = Header(None, alias="X-User-Username")
+):
+    username = x_user_username or "user"
+    history = chatbot_engine.get_conversation_history(conversationId)
+    items = [
+        ChatHistoryItem(
+            role=h["role"],
+            content=h["content"],
+            timestamp=h["timestamp"]
+        )
+        for h in history
+    ]
+    return ChatHistoryResponse(
+        conversationId=conversationId,
+        username=username,
+        messages=items
+    )
+
+
+@app.delete(
+    "/api/v1/chatbot/history",
+    status_code=status.HTTP_200_OK,
+    summary="Clear conversation memory history"
+)
+async def clear_chat_history(
+    conversationId: str = Query(..., description="Conversation UUID")
+):
+    chatbot_engine.clear_conversation_history(conversationId)
+    return {"status": "SUCCESS", "message": f"Cleared memory for conversation {conversationId}"}
+
