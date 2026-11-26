@@ -285,7 +285,7 @@ async def segment_food(
     if len(content) > MAX_UPLOAD_BYTES:
         logger.warning(f"❌ Rejected request: Uploaded image exceeds limit ({MAX_UPLOAD_BYTES} bytes)")
         raise HTTPException(
-            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            status_code=413,
             detail=f"Uploaded image exceeds maximum allowed size of {MAX_UPLOAD_BYTES // (1024 * 1024)} MB"
         )
     if len(content) == 0:

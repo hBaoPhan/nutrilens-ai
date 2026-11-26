@@ -13,11 +13,17 @@ import json
 import uuid
 import logging
 import asyncio
+from collections import OrderedDict
 from datetime import datetime
 from typing import Dict, List, Any, Optional, AsyncGenerator
 import httpx
 from app.chatbot.vector_store import retriever
 from app.schemas import ChatResponse, ChatHistoryItem
+
+try:
+    import redis as redis_lib
+except ImportError:
+    redis_lib = None
 
 logger = logging.getLogger("nutrilens-ai")
 
@@ -25,11 +31,26 @@ logger = logging.getLogger("nutrilens-ai")
 AUTH_SERVICE_URL = os.getenv("AUTH_SERVICE_URL", "http://auth-service:8081")
 MEAL_SERVICE_URL = os.getenv("MEAL_SERVICE_URL", "http://meal-service:8083")
 INTERNAL_SERVICE_SECRET = os.getenv("INTERNAL_SERVICE_SECRET", "")
+REDIS_URL = os.getenv("REDIS_URL", "")
+_CONVERSATION_TTL_SECONDS = int(os.getenv("CHAT_MEMORY_TTL_SECONDS", "86400"))
 
-# Multi-turn sliding window memory: {conversation_id: List[Dict[str, str]]}
-_CONVERSATION_MEMORY: Dict[str, List[Dict[str, str]]] = {}
-_CONVERSATION_OWNERS: Dict[str, str] = {}
+# Bounded LRU fallback memory when Redis is unavailable: {conversation_id: {"owner": str, "messages": [...]}}
+_CONVERSATION_MEMORY: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
+_MAX_IN_MEMORY_CONVERSATIONS = 500
 _MAX_HISTORY_TURNS = 10
+
+
+def _create_redis_client():
+    if not REDIS_URL or redis_lib is None:
+        return None
+    try:
+        client = redis_lib.Redis.from_url(REDIS_URL, decode_responses=True, socket_connect_timeout=1.5, socket_timeout=1.5)
+        client.ping()
+        logger.info("🔌 Connected to Redis for shared RAG Chatbot conversation memory")
+        return client
+    except Exception as ex:
+        logger.warning(f"⚠️ Redis unavailable ({ex}); falling back to bounded in-memory LRU cache")
+        return None
 
 
 def _load_gemini_api_key() -> Optional[str]:
@@ -67,6 +88,7 @@ def _load_gemini_api_key() -> Optional[str]:
 
 class ChatbotRAGEngine:
     def __init__(self):
+        self.redis_client = _create_redis_client()
         self.api_key = _load_gemini_api_key()
         if self.api_key:
             masked = self.api_key[:6] + "..." + self.api_key[-4:] if len(self.api_key) > 10 else "***"
@@ -166,10 +188,53 @@ class ChatbotRAGEngine:
 
         return context
 
+    def _redis_key(self, conversation_id: str) -> str:
+        return f"nutrilens:chat:{conversation_id}"
+
+    def _load_conversation_record(self, conversation_id: str) -> Optional[Dict[str, Any]]:
+        if self.redis_client is not None:
+            try:
+                raw = self.redis_client.get(self._redis_key(conversation_id))
+                if raw:
+                    return json.loads(raw)
+            except Exception as ex:
+                logger.warning(f"Redis read failed, falling back to local memory: {ex}")
+        record = _CONVERSATION_MEMORY.get(conversation_id)
+        if record is not None:
+            _CONVERSATION_MEMORY.move_to_end(conversation_id)
+        return record
+
+    def _save_conversation_record(self, conversation_id: str, record: Dict[str, Any]):
+        if self.redis_client is not None:
+            try:
+                self.redis_client.setex(
+                    self._redis_key(conversation_id),
+                    _CONVERSATION_TTL_SECONDS,
+                    json.dumps(record, ensure_ascii=False)
+                )
+                return
+            except Exception as ex:
+                logger.warning(f"Redis write failed, falling back to local memory: {ex}")
+        _CONVERSATION_MEMORY[conversation_id] = record
+        _CONVERSATION_MEMORY.move_to_end(conversation_id)
+        while len(_CONVERSATION_MEMORY) > _MAX_IN_MEMORY_CONVERSATIONS:
+            _CONVERSATION_MEMORY.popitem(last=False)
+
+    def _delete_conversation_record(self, conversation_id: str):
+        if self.redis_client is not None:
+            try:
+                self.redis_client.delete(self._redis_key(conversation_id))
+            except Exception as ex:
+                logger.warning(f"Redis delete failed: {ex}")
+        _CONVERSATION_MEMORY.pop(conversation_id, None)
+
     def assert_conversation_access(self, conversation_id: str, username: Optional[str], user_role: Optional[str] = None):
         """Enforces Anti-IDOR ownership check on multi-turn conversation memory."""
-        owner = _CONVERSATION_OWNERS.get(conversation_id)
-        if owner is None:
+        record = self._load_conversation_record(conversation_id)
+        if not record:
+            return
+        owner = record.get("owner")
+        if not owner:
             return
         if user_role and user_role.strip().upper() == "ROLE_ADMIN":
             return
@@ -185,22 +250,24 @@ class ChatbotRAGEngine:
         """Returns sliding memory history for the given conversation ID."""
         if username is not None:
             self.assert_conversation_access(conversation_id, username, user_role)
-        return _CONVERSATION_MEMORY.get(conversation_id, [])
+        record = self._load_conversation_record(conversation_id)
+        return list(record.get("messages", [])) if record else []
 
     def append_message_to_history(self, conversation_id: str, role: str, content: str, owner_username: Optional[str] = None):
         """Appends message and prunes memory to sliding window limit."""
-        if conversation_id not in _CONVERSATION_MEMORY:
-            _CONVERSATION_MEMORY[conversation_id] = []
-        if owner_username and conversation_id not in _CONVERSATION_OWNERS:
-            _CONVERSATION_OWNERS[conversation_id] = owner_username.strip()
-        _CONVERSATION_MEMORY[conversation_id].append({
+        record = self._load_conversation_record(conversation_id) or {"owner": None, "messages": []}
+        if owner_username and not record.get("owner"):
+            record["owner"] = owner_username.strip()
+        messages = list(record.get("messages", []))
+        messages.append({
             "role": role,
             "content": content,
             "timestamp": datetime.utcnow().isoformat()
         })
-        # Keep within sliding window (2 * turns for user + assistant)
-        if len(_CONVERSATION_MEMORY[conversation_id]) > _MAX_HISTORY_TURNS * 2:
-            _CONVERSATION_MEMORY[conversation_id] = _CONVERSATION_MEMORY[conversation_id][-_MAX_HISTORY_TURNS * 2:]
+        if len(messages) > _MAX_HISTORY_TURNS * 2:
+            messages = messages[-_MAX_HISTORY_TURNS * 2:]
+        record["messages"] = messages
+        self._save_conversation_record(conversation_id, record)
 
     def clear_conversation_history(
         self,
@@ -211,10 +278,7 @@ class ChatbotRAGEngine:
         """Resets memory for a specific conversation ID."""
         if username is not None:
             self.assert_conversation_access(conversation_id, username, user_role)
-        if conversation_id in _CONVERSATION_MEMORY:
-            del _CONVERSATION_MEMORY[conversation_id]
-        if conversation_id in _CONVERSATION_OWNERS:
-            del _CONVERSATION_OWNERS[conversation_id]
+        self._delete_conversation_record(conversation_id)
 
     def _build_system_prompt(self, user_ctx: Dict[str, Any], retrieved_chunks: List[Dict[str, Any]]) -> str:
         """Constructs grounded clinical nutritionist prompt with strict guardrails."""

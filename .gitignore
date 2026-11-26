@@ -4,16 +4,16 @@ __pycache__/
 *$py.class
 .pytest_cache/
 
-# Môi trường ảo
+# Virtual environments
 .venv/
 venv/
 env/
 
-# Dữ liệu & Kết quả huấn luyện YOLO
+# YOLO training datasets & runs
 dataset/
 runs/
 
-# Trọng số mô hình (Weights & Checkpoints)
+# Model weights & checkpoints
 weights/
 *.pt
 *.pth
@@ -27,14 +27,11 @@ weights/
 .vscode/
 .idea/
 
-# Debug captures & Test directories
+# Debug captures
 debug_captures/
 debug_capture/
 debug_capture*/
 *debug_capture*/
-tests/
-test/
-test_*/
 
 # Secrets & Environment files
 .env

@@ -14,8 +14,8 @@ COPY . /app
 # 1. Install CPU-only PyTorch & Torchvision
 RUN pip install --no-cache-dir torch torchvision --index-url https://download.pytorch.org/whl/cpu
 
-# 2. Install Ultralytics, OpenCV Headless, FastAPI and dependencies
-RUN pip install --no-cache-dir ultralytics opencv-python-headless fastapi uvicorn pydantic python-multipart httpx
+# 2. Install Ultralytics, OpenCV Headless, FastAPI, Redis and dependencies
+RUN pip install --no-cache-dir ultralytics opencv-python-headless fastapi uvicorn pydantic python-multipart httpx redis
 
 EXPOSE 8000
 
