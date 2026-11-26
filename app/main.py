@@ -43,6 +43,27 @@ ARTIFACT_DIR = r"C:\Users\baoph\.gemini\antigravity\brain\fd8f0d58-fe89-4a9f-a99
 # Cache last diagnostic info in memory for instant inspection
 last_diagnostic_cache = {}
 
+# Security limits & feature flags
+MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", str(10 * 1024 * 1024)))
+ENABLE_DEBUG_ENDPOINTS = os.getenv("ENABLE_DEBUG_ENDPOINTS", "false").lower() == "true"
+
+
+def _require_debug_endpoints_enabled():
+    if not ENABLE_DEBUG_ENDPOINTS:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Debug diagnostic endpoints are disabled"
+        )
+
+
+def _require_authenticated_user(x_user_username: Optional[str]) -> str:
+    if not x_user_username or not x_user_username.strip():
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Unauthorized: Missing authenticated user identity"
+        )
+    return x_user_username.strip()
+
 
 def get_debug_capture_dirs() -> List[str]:
     """
@@ -202,6 +223,7 @@ async def health_check():
 
 @app.get("/api/v1/vision/last-capture", status_code=status.HTTP_200_OK)
 async def get_last_capture():
+    _require_debug_endpoints_enabled()
     for d in get_debug_capture_dirs():
         last_file = os.path.join(d, "last_unity_capture.jpg")
         if os.path.exists(last_file):
@@ -211,6 +233,7 @@ async def get_last_capture():
 
 @app.get("/api/v1/vision/last-prediction", status_code=status.HTTP_200_OK)
 async def get_last_prediction():
+    _require_debug_endpoints_enabled()
     for d in get_debug_capture_dirs():
         last_file = os.path.join(d, "last_unity_prediction.jpg")
         if os.path.exists(last_file):
@@ -220,6 +243,7 @@ async def get_last_prediction():
 
 @app.get("/api/v1/vision/diagnose-last", status_code=status.HTTP_200_OK)
 async def get_last_diagnostic():
+    _require_debug_endpoints_enabled()
     if not last_diagnostic_cache:
         raise HTTPException(status_code=404, detail="No capture diagnostic available yet")
     return last_diagnostic_cache
@@ -246,7 +270,13 @@ async def segment_food(
             detail=f"Unsupported image format: {image.content_type}. Only JPEG, PNG, and WebP are allowed."
         )
 
-    content = await image.read()
+    content = await image.read(MAX_UPLOAD_BYTES + 1)
+    if len(content) > MAX_UPLOAD_BYTES:
+        logger.warning(f"❌ Rejected request: Uploaded image exceeds limit ({MAX_UPLOAD_BYTES} bytes)")
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail=f"Uploaded image exceeds maximum allowed size of {MAX_UPLOAD_BYTES // (1024 * 1024)} MB"
+        )
     if len(content) == 0:
         logger.warning("❌ Rejected request: Uploaded image payload is empty")
         raise HTTPException(
@@ -431,14 +461,19 @@ async def suggest_meal_rag(request: RAGRecommendationRequest):
 )
 async def chat_with_bot(
     request: ChatRequest,
-    x_user_username: Optional[str] = Header(None, alias="X-User-Username")
+    x_user_username: Optional[str] = Header(None, alias="X-User-Username"),
+    x_user_role: Optional[str] = Header(None, alias="X-User-Role")
 ):
-    username = x_user_username or "user"
-    return await chatbot_engine.chat(
-        query=request.message,
-        username=username,
-        conversation_id=request.conversationId
-    )
+    username = _require_authenticated_user(x_user_username)
+    try:
+        return await chatbot_engine.chat(
+            query=request.message,
+            username=username,
+            conversation_id=request.conversationId,
+            user_role=x_user_role
+        )
+    except PermissionError as exc:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(exc))
 
 
 @app.post(
@@ -447,14 +482,21 @@ async def chat_with_bot(
 )
 async def chat_with_bot_stream(
     request: ChatRequest,
-    x_user_username: Optional[str] = Header(None, alias="X-User-Username")
+    x_user_username: Optional[str] = Header(None, alias="X-User-Username"),
+    x_user_role: Optional[str] = Header(None, alias="X-User-Role")
 ):
-    username = x_user_username or "user"
+    username = _require_authenticated_user(x_user_username)
+    try:
+        if request.conversationId:
+            chatbot_engine.assert_conversation_access(request.conversationId, username, x_user_role)
+    except PermissionError as exc:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(exc))
     return StreamingResponse(
         chatbot_engine.chat_stream(
             query=request.message,
             username=username,
-            conversation_id=request.conversationId
+            conversation_id=request.conversationId,
+            user_role=x_user_role
         ),
         media_type="text/event-stream"
     )
@@ -468,10 +510,14 @@ async def chat_with_bot_stream(
 )
 async def get_chat_history(
     conversationId: str = Query(..., description="Conversation UUID"),
-    x_user_username: Optional[str] = Header(None, alias="X-User-Username")
+    x_user_username: Optional[str] = Header(None, alias="X-User-Username"),
+    x_user_role: Optional[str] = Header(None, alias="X-User-Role")
 ):
-    username = x_user_username or "user"
-    history = chatbot_engine.get_conversation_history(conversationId)
+    username = _require_authenticated_user(x_user_username)
+    try:
+        history = chatbot_engine.get_conversation_history(conversationId, username=username, user_role=x_user_role)
+    except PermissionError as exc:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(exc))
     items = [
         ChatHistoryItem(
             role=h["role"],
@@ -493,8 +539,14 @@ async def get_chat_history(
     summary="Clear conversation memory history"
 )
 async def clear_chat_history(
-    conversationId: str = Query(..., description="Conversation UUID")
+    conversationId: str = Query(..., description="Conversation UUID"),
+    x_user_username: Optional[str] = Header(None, alias="X-User-Username"),
+    x_user_role: Optional[str] = Header(None, alias="X-User-Role")
 ):
-    chatbot_engine.clear_conversation_history(conversationId)
+    username = _require_authenticated_user(x_user_username)
+    try:
+        chatbot_engine.clear_conversation_history(conversationId, username=username, user_role=x_user_role)
+    except PermissionError as exc:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(exc))
     return {"status": "SUCCESS", "message": f"Cleared memory for conversation {conversationId}"}
 

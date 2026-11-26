@@ -21,12 +21,14 @@ from app.schemas import ChatResponse, ChatHistoryItem
 
 logger = logging.getLogger("nutrilens-ai")
 
-# Microservice endpoints
+# Microservice endpoints & internal auth
 AUTH_SERVICE_URL = os.getenv("AUTH_SERVICE_URL", "http://auth-service:8081")
 MEAL_SERVICE_URL = os.getenv("MEAL_SERVICE_URL", "http://meal-service:8083")
+INTERNAL_SERVICE_SECRET = os.getenv("INTERNAL_SERVICE_SECRET", "")
 
 # Multi-turn sliding window memory: {conversation_id: List[Dict[str, str]]}
 _CONVERSATION_MEMORY: Dict[str, List[Dict[str, str]]] = {}
+_CONVERSATION_OWNERS: Dict[str, str] = {}
 _MAX_HISTORY_TURNS = 10
 
 
@@ -95,11 +97,22 @@ class ChatbotRAGEngine:
         auth_hosts = [AUTH_SERVICE_URL, "http://localhost:8081", "http://127.0.0.1:8081"]
         meal_hosts = [MEAL_SERVICE_URL, "http://localhost:8083", "http://127.0.0.1:8083"]
 
+        internal_headers = {}
+        if INTERNAL_SERVICE_SECRET:
+            internal_headers["X-Internal-Token"] = INTERNAL_SERVICE_SECRET
+        user_headers = {
+            "X-User-Username": username,
+            "X-User-Role": "ROLE_USER"
+        }
+
         async with httpx.AsyncClient(timeout=2.5) as client:
-            # 1. Fetch User Profile
+            # 1. Fetch User Profile via internal endpoint
             for ah in auth_hosts:
                 try:
-                    resp = await client.get(f"{ah}/api/v1/auth/profile", params={"username": username})
+                    resp = await client.get(
+                        f"{ah}/api/auth/internal/users/{username}",
+                        headers=internal_headers
+                    )
                     if resp.status_code == 200:
                         data = resp.json()
                         context["fitnessGoal"] = data.get("fitnessGoal", context["fitnessGoal"])
@@ -113,14 +126,22 @@ class ChatbotRAGEngine:
             # 2. Fetch Today's Consumed Calories & Meals
             for mh in meal_hosts:
                 try:
-                    c_resp = await client.get(f"{mh}/api/meal-logs/internal/today-calories", params={"username": username})
+                    c_resp = await client.get(
+                        f"{mh}/api/meal-logs/internal/today-calories",
+                        params={"username": username},
+                        headers=internal_headers
+                    )
                     if c_resp.status_code == 200:
                         c_data = c_resp.json()
                         consumed = float(c_data.get("consumedCalories", 0.0))
                         context["todayConsumedKcal"] = consumed
                         context["remainingKcalToday"] = max(0.0, context["dailyCalorieGoal"] - consumed)
 
-                    m_resp = await client.get(f"{mh}/api/v1/nutrition/meal-logs", params={"username": username, "limit": 5})
+                    m_resp = await client.get(
+                        f"{mh}/api/v1/nutrition/meal-logs",
+                        params={"username": username, "limit": 5},
+                        headers=user_headers
+                    )
                     if m_resp.status_code == 200:
                         m_data = m_resp.json()
                         if isinstance(m_data, list):
@@ -138,14 +159,33 @@ class ChatbotRAGEngine:
 
         return context
 
-    def get_conversation_history(self, conversation_id: str) -> List[Dict[str, str]]:
+    def assert_conversation_access(self, conversation_id: str, username: Optional[str], user_role: Optional[str] = None):
+        """Enforces Anti-IDOR ownership check on multi-turn conversation memory."""
+        owner = _CONVERSATION_OWNERS.get(conversation_id)
+        if owner is None:
+            return
+        if user_role and user_role.strip().upper() == "ROLE_ADMIN":
+            return
+        if not username or owner.lower() != username.strip().lower():
+            raise PermissionError("Forbidden: You do not have access to this conversation")
+
+    def get_conversation_history(
+        self,
+        conversation_id: str,
+        username: Optional[str] = None,
+        user_role: Optional[str] = None
+    ) -> List[Dict[str, str]]:
         """Returns sliding memory history for the given conversation ID."""
+        if username is not None:
+            self.assert_conversation_access(conversation_id, username, user_role)
         return _CONVERSATION_MEMORY.get(conversation_id, [])
 
-    def append_message_to_history(self, conversation_id: str, role: str, content: str):
+    def append_message_to_history(self, conversation_id: str, role: str, content: str, owner_username: Optional[str] = None):
         """Appends message and prunes memory to sliding window limit."""
         if conversation_id not in _CONVERSATION_MEMORY:
             _CONVERSATION_MEMORY[conversation_id] = []
+        if owner_username and conversation_id not in _CONVERSATION_OWNERS:
+            _CONVERSATION_OWNERS[conversation_id] = owner_username.strip()
         _CONVERSATION_MEMORY[conversation_id].append({
             "role": role,
             "content": content,
@@ -155,10 +195,19 @@ class ChatbotRAGEngine:
         if len(_CONVERSATION_MEMORY[conversation_id]) > _MAX_HISTORY_TURNS * 2:
             _CONVERSATION_MEMORY[conversation_id] = _CONVERSATION_MEMORY[conversation_id][-_MAX_HISTORY_TURNS * 2:]
 
-    def clear_conversation_history(self, conversation_id: str):
+    def clear_conversation_history(
+        self,
+        conversation_id: str,
+        username: Optional[str] = None,
+        user_role: Optional[str] = None
+    ):
         """Resets memory for a specific conversation ID."""
+        if username is not None:
+            self.assert_conversation_access(conversation_id, username, user_role)
         if conversation_id in _CONVERSATION_MEMORY:
             del _CONVERSATION_MEMORY[conversation_id]
+        if conversation_id in _CONVERSATION_OWNERS:
+            del _CONVERSATION_OWNERS[conversation_id]
 
     def _build_system_prompt(self, user_ctx: Dict[str, Any], retrieved_chunks: List[Dict[str, Any]]) -> str:
         """Constructs grounded clinical nutritionist prompt with strict guardrails."""
@@ -287,9 +336,16 @@ class ChatbotRAGEngine:
 
         return None
 
-    async def chat(self, query: str, username: str, conversation_id: Optional[str] = None) -> ChatResponse:
+    async def chat(
+        self,
+        query: str,
+        username: str,
+        conversation_id: Optional[str] = None,
+        user_role: Optional[str] = None
+    ) -> ChatResponse:
         """Processes user message and generates grounded response."""
         cid = conversation_id or str(uuid.uuid4())
+        self.assert_conversation_access(cid, username, user_role)
         logger.info(f"💬 Chatbot request for '{username}' (conv: {cid[:8]}...): '{query}'")
 
         # 1. Fetch personal context & semantic knowledge concurrently
@@ -298,7 +354,7 @@ class ChatbotRAGEngine:
         user_ctx = await personal_task
 
         # 2. Get history and build system prompt
-        history = self.get_conversation_history(cid)
+        history = self.get_conversation_history(cid, username=username, user_role=user_role)
         system_prompt = self._build_system_prompt(user_ctx, chunks)
 
         # 3. Call Gemini LLM or fallback
@@ -311,8 +367,8 @@ class ChatbotRAGEngine:
             model_source = "CLINICAL_KNOWLEDGE_SYNTHESIZER"
 
         # 4. Save to conversation memory
-        self.append_message_to_history(cid, "user", query)
-        self.append_message_to_history(cid, "assistant", reply)
+        self.append_message_to_history(cid, "user", query, owner_username=username)
+        self.append_message_to_history(cid, "assistant", reply, owner_username=username)
 
         return ChatResponse(
             reply=reply,
@@ -323,9 +379,15 @@ class ChatbotRAGEngine:
             timestamp=datetime.utcnow().isoformat()
         )
 
-    async def chat_stream(self, query: str, username: str, conversation_id: Optional[str] = None) -> AsyncGenerator[str, None]:
+    async def chat_stream(
+        self,
+        query: str,
+        username: str,
+        conversation_id: Optional[str] = None,
+        user_role: Optional[str] = None
+    ) -> AsyncGenerator[str, None]:
         """Streams chatbot response tokens using Server-Sent Events (SSE)."""
-        chat_resp = await self.chat(query, username, conversation_id)
+        chat_resp = await self.chat(query, username, conversation_id, user_role=user_role)
         full_text = chat_resp.reply
 
         # Initial metadata event
