@@ -246,24 +246,26 @@ class NutriLensRAGRecommender:
             logger.info(f"[GEMINI RAG] Sending request to Gemini for {len(dishes)} dishes...")
 
             models_to_try = [
-                "gemini-3.5-flash",
+                "gemini-flash-lite-latest",
+                "gemini-3.5-flash-lite",
                 "gemini-3.1-flash-lite",
-                "gemma-4-26b-a4b-it",
+                "gemini-3-flash-preview",
                 "gemini-flash-latest",
-                "gemini-3.8-flash"
+                "gemma-4-26b-a4b-it",
             ]
-
-            masked_key = api_key[:6] + "..." + api_key[-4:] if len(api_key) > 10 else "***"
 
             for model in models_to_try:
                 try:
-                    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
-                    print(f"[GEMINI RAG] Calling model '{model}' ({url.replace(api_key, masked_key)})...", flush=True)
+                    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+                    logger.info(f"[GEMINI RAG] Calling model '{model}'...")
 
                     req = urllib.request.Request(
                         url,
                         data=json.dumps(payload).encode("utf-8"),
-                        headers={"Content-Type": "application/json"},
+                        headers={
+                            "Content-Type": "application/json",
+                            "x-goog-api-key": api_key,
+                        },
                         method="POST"
                     )
                     with urllib.request.urlopen(req, timeout=8) as resp:
@@ -271,39 +273,30 @@ class NutriLensRAGRecommender:
                             raw_body = resp.read().decode("utf-8")
                             data = json.loads(raw_body)
 
-                            # ------------------------------------------------------------------
-                            # PRINT INCOMING RESPONSE TO TERMINAL & CONTAINER LOGS
-                            # ------------------------------------------------------------------
-                            print("\n" + "=" * 80, flush=True)
-                            print(f"[GEMINI RAG] <<< INCOMING RESPONSE FROM GEMINI ({model}) <<<", flush=True)
-                            print(f"HTTP Status: {resp.status}", flush=True)
-                            print("-" * 30 + " RAW RESPONSE JSON " + "-" * 30, flush=True)
-                            print(json.dumps(data, ensure_ascii=False, indent=2), flush=True)
-
                             candidates = data.get("candidates", [])
                             if candidates:
                                 parts = candidates[0].get("content", {}).get("parts", [])
-                                text = "".join(p.get("text", "") for p in parts if "text" in p).strip()
+                                text = "".join(
+                                    p.get("text", "")
+                                    for p in parts
+                                    if isinstance(p, dict) and not p.get("thought") and "text" in p
+                                ).strip()
                                 if text:
-                                    print("-" * 28 + " EXTRACTED RATIONALE " + "-" * 29, flush=True)
-                                    print(text, flush=True)
-                                    print("=" * 80 + "\n", flush=True)
                                     logger.info(f"✨ Gemini RAG generation successful with model '{model}': {text[:60]}...")
                                     return text
                                 else:
-                                    print("[GEMINI RAG] Warning: No text in candidate parts.", flush=True)
-                                    print("=" * 80 + "\n", flush=True)
+                                    logger.warning(f"[GEMINI RAG] Model '{model}' returned empty visible text; trying fallback.")
                 except urllib.error.HTTPError as he:
                     err_body = he.read().decode("utf-8", errors="replace") if hasattr(he, "read") else ""
-                    print(f"[GEMINI RAG] Model '{model}' HTTP Error {he.code}: {err_body}", flush=True)
-                    logger.debug(f"Model {model} HTTP {he.code}. Trying fallback...")
+                    logger.warning(f"[GEMINI RAG] Model '{model}' HTTP Error {he.code}: {err_body[:140]}")
+                    if he.code in (401, 403):
+                        return None
                     continue
                 except Exception as ex:
-                    print(f"[GEMINI RAG] Model '{model}' Exception: {ex}", flush=True)
-                    logger.debug(f"Model {model} failed: {ex}. Trying fallback...")
+                    logger.warning(f"[GEMINI RAG] Model '{model}' Exception: {type(ex).__name__}: {ex}")
                     continue
 
-            print("[GEMINI RAG] ⚠️ All candidate models failed or unavailable. Falling back to local clinical rule synthesizer.\n", flush=True)
+            logger.info("[GEMINI RAG] ⚠️ All candidate models failed or unavailable. Falling back to local clinical rule synthesizer.")
             return None
         except Exception as e:
             print(f"[GEMINI RAG] Exception during Gemini call: {e}\n", flush=True)

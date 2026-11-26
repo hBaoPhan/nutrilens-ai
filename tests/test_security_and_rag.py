@@ -115,3 +115,66 @@ async def test_rag_fetch_personal_context_parses_raw_float_and_total_kcal(monkey
     assert len(ctx["todayMeals"]) == 2
     assert ctx["todayMeals"][0]["dishName"] == "Bánh Mì Thịt Nướng"
     assert ctx["todayMeals"][0]["calories"] == pytest.approx(450.5)
+
+
+@pytest.mark.anyio
+async def test_gemini_failover_uses_header_skips_503_cooldown_and_filters_thoughts(monkeypatch):
+    engine = ChatbotRAGEngine()
+    engine.api_key = "test-secret-api-key-value"
+    monkeypatch.setattr("app.chatbot.rag_engine._load_gemini_api_key", lambda: "test-secret-api-key-value")
+    monkeypatch.setenv("GEMINI_CHAT_MODELS", "model-overloaded,model-thinking,model-healthy")
+
+    called_urls = []
+    called_headers = []
+
+    class MockGeminiClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def post(self, url, json=None, headers=None, timeout=None):
+            called_urls.append(url)
+            called_headers.append(headers or {})
+            if "model-overloaded" in url:
+                return Response(503, json={"error": {"code": 503, "message": "high demand"}})
+            if "model-thinking" in url:
+                # Returns internal thought part + actual visible reply
+                return Response(200, json={
+                    "candidates": [{
+                        "content": {
+                            "parts": [
+                                {"thought": True, "text": "Internal English reasoning..."},
+                                {"text": "Bạn nên chọn Ức Gà Nướng (380 kcal)."}
+                            ]
+                        }
+                    }]
+                })
+            return Response(200, json={
+                "candidates": [{"content": {"parts": [{"text": "Fallback healthy reply."}]}}]
+            })
+
+    monkeypatch.setattr("app.chatbot.rag_engine.httpx.AsyncClient", MockGeminiClient)
+
+    # First call: model-overloaded returns 503 -> cooldown, fails over to model-thinking -> strips thought part
+    reply1, used1 = await engine._call_gemini_api("sys", [], "Hôm nay ăn gì?")
+    assert used1 == "model-thinking"
+    assert reply1 == "Bạn nên chọn Ức Gà Nướng (380 kcal)."
+    assert "Internal English reasoning" not in reply1
+
+    # Verify API key is NEVER placed in query string and IS sent via x-goog-api-key header
+    for u, h in zip(called_urls, called_headers):
+        assert "?key=" not in u
+        assert "test-secret-api-key-value" not in u
+        assert h.get("x-goog-api-key") == "test-secret-api-key-value"
+
+    # Second call: model-overloaded is in cooldown, so it must be skipped immediately
+    called_urls.clear()
+    reply2, used2 = await engine._call_gemini_api("sys", [], "Gợi ý bữa tối?")
+    assert used2 == "model-thinking"
+    assert all("model-overloaded" not in u for u in called_urls)
+    assert "model-overloaded" in engine.get_llm_status()["cooledDownModels"]

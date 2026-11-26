@@ -25,6 +25,9 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] [NutriLens-AI] %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S"
 )
+# Prevent verbose HTTP client logs from printing raw request URLs / query parameters
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 logger = logging.getLogger("nutrilens-ai")
 
 app = FastAPI(
@@ -228,6 +231,7 @@ async def health_check():
         "service": "nutrilens-ai-segmentation",
         "modelLoaded": model_loaded,
         "weights": engine.weights_path,
+        "chatbot": chatbot_engine.get_llm_status(),
         "debugCaptureDirs": get_debug_capture_dirs()
     }
 

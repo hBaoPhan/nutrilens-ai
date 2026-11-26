@@ -11,11 +11,12 @@ Integrates:
 import os
 import json
 import uuid
+import time
 import logging
 import asyncio
 from collections import OrderedDict
 from datetime import datetime
-from typing import Dict, List, Any, Optional, AsyncGenerator
+from typing import Dict, List, Any, Optional, AsyncGenerator, Tuple
 import httpx
 from app.chatbot.vector_store import retriever
 from app.schemas import ChatResponse, ChatHistoryItem
@@ -33,6 +34,20 @@ MEAL_SERVICE_URL = os.getenv("MEAL_SERVICE_URL", "http://meal-service:8083")
 INTERNAL_SERVICE_SECRET = os.getenv("INTERNAL_SERVICE_SECRET", "")
 REDIS_URL = os.getenv("REDIS_URL", "")
 _CONVERSATION_TTL_SECONDS = int(os.getenv("CHAT_MEMORY_TTL_SECONDS", "86400"))
+
+# Gemini LLM failover & circuit-breaker configuration
+DEFAULT_CHAT_MODELS: List[str] = [
+    "gemini-flash-lite-latest",
+    "gemini-3.5-flash-lite",
+    "gemini-3.1-flash-lite",
+    "gemini-3-flash-preview",
+    "gemini-flash-latest",
+    "gemma-4-26b-a4b-it",
+]
+GEMINI_PER_MODEL_TIMEOUT_SECONDS = float(os.getenv("GEMINI_PER_MODEL_TIMEOUT_SECONDS", "8.0"))
+GEMINI_TOTAL_TIMEOUT_SECONDS = float(os.getenv("GEMINI_TOTAL_TIMEOUT_SECONDS", "18.0"))
+MODEL_TRANSIENT_COOLDOWN_SECONDS = float(os.getenv("GEMINI_MODEL_COOLDOWN_SECONDS", "60.0"))
+MODEL_PERMANENT_COOLDOWN_SECONDS = float(os.getenv("GEMINI_MODEL_INVALID_COOLDOWN_SECONDS", "600.0"))
 
 # Bounded LRU fallback memory when Redis is unavailable: {conversation_id: {"owner": str, "messages": [...]}}
 _CONVERSATION_MEMORY: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
@@ -90,11 +105,87 @@ class ChatbotRAGEngine:
     def __init__(self):
         self.redis_client = _create_redis_client()
         self.api_key = _load_gemini_api_key()
+        self._model_cooldowns: Dict[str, float] = {}
+        self._last_active_model: Optional[str] = None
         if self.api_key:
             masked = self.api_key[:6] + "..." + self.api_key[-4:] if len(self.api_key) > 10 else "***"
             logger.info(f"✨ Gemini API Key active ({masked}) for RAG Chatbot")
         else:
             logger.info("ℹ️ No GEMINI_API_KEY set; using Clinical Knowledge Synthesizer fallback")
+
+    def _get_configured_models(self) -> List[str]:
+        raw = os.getenv("GEMINI_CHAT_MODELS") or os.getenv("GEMINI_MODELS") or ""
+        if raw.strip():
+            parsed = [m.strip() for m in raw.split(",") if m.strip()]
+            if parsed:
+                return parsed
+        return list(DEFAULT_CHAT_MODELS)
+
+    def _select_models_for_attempt(self) -> List[str]:
+        """
+        Orders healthy models first; skips models currently in 503/429/timeout cooldown.
+        If all models are cooled down (half-open circuit breaker), probes the 2 models
+        closest to cooldown expiration so the service self-heals automatically.
+        """
+        now = time.monotonic()
+        configured = self._get_configured_models()
+        healthy: List[str] = []
+        cooled: List[Tuple[float, str]] = []
+
+        for model in configured:
+            until = self._model_cooldowns.get(model, 0.0)
+            if until <= now:
+                self._model_cooldowns.pop(model, None)
+                healthy.append(model)
+            else:
+                cooled.append((until, model))
+
+        if healthy:
+            return healthy
+
+        # Half-open fallback: probe up to 2 models closest to recovery
+        cooled.sort(key=lambda item: item[0])
+        return [m for _, m in cooled[:2]]
+
+    def _mark_model_cooldown(self, model: str, seconds: float, reason: str):
+        self._model_cooldowns[model] = time.monotonic() + seconds
+        logger.warning(f"⏸️ Model '{model}' placed in {seconds:.0f}s cooldown ({reason})")
+
+    def get_llm_status(self) -> Dict[str, Any]:
+        """Returns non-sensitive live diagnostics for /health monitoring."""
+        now = time.monotonic()
+        configured = self._get_configured_models()
+        cooled = {
+            m: round(max(0.0, until - now), 1)
+            for m, until in self._model_cooldowns.items()
+            if until > now
+        }
+        healthy = [m for m in configured if m not in cooled]
+        return {
+            "apiKeyConfigured": bool(self.api_key or _load_gemini_api_key()),
+            "redisConnected": self.redis_client is not None,
+            "lastActiveModel": self._last_active_model,
+            "configuredModels": configured,
+            "healthyModels": healthy,
+            "cooledDownModels": cooled,
+        }
+
+    @staticmethod
+    def _extract_response_text(data: Dict[str, Any]) -> str:
+        """
+        Extracts clean final answer text from Gemini/Gemma response JSON,
+        strictly excluding internal reasoning parts (thought=True).
+        """
+        candidates = data.get("candidates") or []
+        if not candidates:
+            return ""
+        parts = candidates[0].get("content", {}).get("parts") or []
+        visible_parts = [
+            p.get("text", "")
+            for p in parts
+            if isinstance(p, dict) and not p.get("thought") and p.get("text")
+        ]
+        return "".join(visible_parts).strip()
 
     async def fetch_personal_context(self, username: str) -> Dict[str, Any]:
         """
@@ -357,11 +448,23 @@ class ChatbotRAGEngine:
         response_lines.append("\n*(Lời khuyên được tổng hợp từ Cơ sở Dữ liệu Dinh dưỡng Lâm sàng AR-NutriLens)*")
         return "\n".join(response_lines)
 
-    async def _call_gemini_api(self, system_prompt: str, history: List[Dict[str, str]], query: str) -> Optional[str]:
-        """Calls Google Gemini API with fallback across high-performance models."""
+    async def _call_gemini_api(
+        self,
+        system_prompt: str,
+        history: List[Dict[str, str]],
+        query: str
+    ) -> Tuple[Optional[str], Optional[str]]:
+        """
+        Calls Google Gemini API with:
+        - x-goog-api-key header (prevents API key leakage in HTTP/proxy logs)
+        - Circuit-breaker cooldown for 503/429/timeout models
+        - Bounded wall-clock deadline & per-model timeout
+        - Thought-part filtering for reasoning models (Gemini 3.x / Gemma 4)
+        Returns (reply_text, model_name).
+        """
         self.api_key = _load_gemini_api_key()
         if not self.api_key:
-            return None
+            return None, None
 
         # Build contents array from history + current turn
         contents = []
@@ -380,32 +483,62 @@ class ChatbotRAGEngine:
             }
         }
 
-        models_to_try = [
-            "gemini-3.1-flash-lite",
-            "gemma-4-26b-a4b-it",
-            "gemini-flash-latest",
-            "gemini-3.5-flash"
-        ]
+        headers = {
+            "Content-Type": "application/json",
+            "x-goog-api-key": self.api_key,
+        }
 
-        async with httpx.AsyncClient(timeout=12.0) as client:
+        models_to_try = self._select_models_for_attempt()
+        deadline = time.monotonic() + GEMINI_TOTAL_TIMEOUT_SECONDS
+
+        async with httpx.AsyncClient() as client:
             for model in models_to_try:
-                url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={self.api_key}"
+                remaining = deadline - time.monotonic()
+                if remaining <= 1.0:
+                    logger.warning(
+                        f"⏱️ Gemini total latency budget ({GEMINI_TOTAL_TIMEOUT_SECONDS:.0f}s) exhausted before trying '{model}'"
+                    )
+                    break
+
+                per_req_timeout = min(GEMINI_PER_MODEL_TIMEOUT_SECONDS, remaining)
+                url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+
                 try:
-                    resp = await client.post(url, json=payload, headers={"Content-Type": "application/json"})
+                    resp = await client.post(
+                        url,
+                        json=payload,
+                        headers=headers,
+                        timeout=per_req_timeout
+                    )
                     if resp.status_code == 200:
                         data = resp.json()
-                        candidates = data.get("candidates", [])
-                        if candidates:
-                            part_text = candidates[0].get("content", {}).get("parts", [{}])[0].get("text", "")
-                            if part_text.strip():
-                                logger.info(f"✅ Gemini RAG Response generated successfully via [{model}]")
-                                return part_text.strip()
+                        part_text = self._extract_response_text(data)
+                        if part_text:
+                            self._model_cooldowns.pop(model, None)
+                            self._last_active_model = model
+                            logger.info(f"✅ Gemini RAG Response generated successfully via [{model}]")
+                            return part_text, model
+                        logger.warning(f"Gemini model '{model}' returned 200 but empty visible text (thinking-only or filtered); trying next model.")
+                        self._mark_model_cooldown(model, 30.0, "empty visible output")
+                    elif resp.status_code in (401, 403):
+                        logger.error(f"Gemini API authentication error ({resp.status_code}) on {model}. Check GEMINI_API_KEY.")
+                        return None, None
+                    elif resp.status_code in (400, 404):
+                        logger.warning(f"Gemini API returned status {resp.status_code} on {model}: {resp.text[:140]}")
+                        self._mark_model_cooldown(model, MODEL_PERMANENT_COOLDOWN_SECONDS, f"HTTP {resp.status_code}")
+                    elif resp.status_code in (429, 500, 502, 503, 504):
+                        logger.warning(f"Gemini API returned status {resp.status_code} on {model}: {resp.text[:140]}")
+                        self._mark_model_cooldown(model, MODEL_TRANSIENT_COOLDOWN_SECONDS, f"HTTP {resp.status_code}")
                     else:
-                        logger.warning(f"Gemini API returned status {resp.status_code} on {model}: {resp.text[:120]}")
+                        logger.warning(f"Gemini API returned status {resp.status_code} on {model}: {resp.text[:140]}")
+                except httpx.TimeoutException as ex:
+                    logger.warning(f"Timeout ({per_req_timeout:.1f}s) requesting Gemini API on {model}: {type(ex).__name__}")
+                    self._mark_model_cooldown(model, MODEL_TRANSIENT_COOLDOWN_SECONDS, type(ex).__name__)
                 except Exception as ex:
-                    logger.warning(f"Error requesting Gemini API on {model}: {ex}")
+                    logger.warning(f"Error requesting Gemini API on {model}: {type(ex).__name__}: {ex}")
+                    self._mark_model_cooldown(model, MODEL_TRANSIENT_COOLDOWN_SECONDS, type(ex).__name__)
 
-        return None
+        return None, None
 
     async def chat(
         self,
@@ -429,8 +562,8 @@ class ChatbotRAGEngine:
         system_prompt = self._build_system_prompt(user_ctx, chunks)
 
         # 3. Call Gemini LLM or fallback
-        reply = await self._call_gemini_api(system_prompt, history, query)
-        model_source = "GOOGLE_GEMINI_FLASH"
+        reply, used_model = await self._call_gemini_api(system_prompt, history, query)
+        model_source = f"GOOGLE_GEMINI ({used_model})" if used_model else "GOOGLE_GEMINI_FLASH"
 
         if not reply:
             logger.info("⚠️ Gemini API unavailable. Using Clinical Knowledge Synthesizer fallback.")
