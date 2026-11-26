@@ -178,3 +178,39 @@ async def test_gemini_failover_uses_header_skips_503_cooldown_and_filters_though
     assert used2 == "model-thinking"
     assert all("model-overloaded" not in u for u in called_urls)
     assert "model-overloaded" in engine.get_llm_status()["cooledDownModels"]
+
+
+def test_chatbot_prompt_and_plain_format_strip_markdown():
+    from app.chatbot.rag_engine import _humanize_goal, _friendly_user_address, _strip_markdown
+
+    assert _humanize_goal("MAINTAIN") == "duy trì vóc dáng cân đối"
+    assert _humanize_goal("LOSE_WEIGHT") == "giảm cân, giảm mỡ"
+    assert _friendly_user_address("admin") == "bạn"
+    assert _friendly_user_address("user1") == "bạn"
+    assert _friendly_user_address("Bảo") == "Bảo"
+
+    engine = ChatbotRAGEngine()
+    prompt = engine._build_system_prompt(
+        {
+            "username": "admin",
+            "fitnessGoal": "MAINTAIN",
+            "weightKg": 65.0,
+            "heightCm": 170.0,
+            "dailyCalorieGoal": 2100,
+            "todayConsumedKcal": 500.0,
+            "remainingKcalToday": 1600.0,
+            "todayMeals": [],
+        },
+        [],
+        response_format="markdown",
+    )
+    assert "Cách xưng hô: bạn" in prompt
+    assert "duy trì vóc dáng cân đối" in prompt
+
+    raw_md = "### Bữa Sáng\n* **Món chính:** *Phở bò* (`430 kcal`)\n---\n- Trứng luộc"
+    plain = _strip_markdown(raw_md)
+    assert "#" not in plain
+    assert "**" not in plain
+    assert "`" not in plain
+    assert "• Món chính: Phở bò (430 kcal)" in plain
+    assert "• Trứng luộc" in plain

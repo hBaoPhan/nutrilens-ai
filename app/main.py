@@ -449,7 +449,8 @@ async def chat_with_bot(
             query=request.message,
             username=username,
             conversation_id=request.conversationId,
-            user_role=x_user_role
+            user_role=x_user_role,
+            response_format=request.responseFormat or "markdown"
         )
     except PermissionError as exc:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(exc))
@@ -475,7 +476,8 @@ async def chat_with_bot_stream(
             query=request.message,
             username=username,
             conversation_id=request.conversationId,
-            user_role=x_user_role
+            user_role=x_user_role,
+            response_format=request.responseFormat or "markdown"
         ),
         media_type="text/event-stream"
     )

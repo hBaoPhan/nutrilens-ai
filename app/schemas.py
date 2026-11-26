@@ -100,6 +100,11 @@ class ChatRequest(BaseModel):
     message: str = Field(..., min_length=1, max_length=1000, description="User's query or message")
     conversationId: Optional[str] = Field(None, description="Client session or conversation UUID")
     stream: Optional[bool] = Field(False, description="Whether to stream response tokens via SSE")
+    responseFormat: Optional[str] = Field(
+        "markdown",
+        pattern="^(markdown|plain)$",
+        description="Preferred reply format: 'markdown' (light mobile markdown) or 'plain' (no markdown symbols)"
+    )
 
 class ChatResponse(BaseModel):
     reply: str
