@@ -223,7 +223,7 @@ class ChatbotRAGEngine:
             for ah in auth_hosts:
                 try:
                     resp = await client.get(
-                        f"{ah}/api/auth/internal/users/{username}",
+                        f"{ah}/api/v1/auth/internal/users/{username}",
                         headers=internal_headers
                     )
                     if resp.status_code == 200:
@@ -240,7 +240,7 @@ class ChatbotRAGEngine:
             for mh in meal_hosts:
                 try:
                     c_resp = await client.get(
-                        f"{mh}/api/meal-logs/internal/today-calories",
+                        f"{mh}/api/v1/meal-logs/internal/today-calories",
                         params={"username": username},
                         headers=internal_headers
                     )

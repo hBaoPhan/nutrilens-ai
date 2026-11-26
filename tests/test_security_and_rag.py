@@ -88,14 +88,14 @@ async def test_rag_fetch_personal_context_parses_raw_float_and_total_kcal(monkey
             return False
 
         async def get(self, url, params=None, headers=None):
-            if "/api/auth/internal/users/" in url:
+            if "/api/v1/auth/internal/users/" in url:
                 return Response(200, json={
                     "fitnessGoal": "LOSE_WEIGHT",
                     "weightKg": 64.0,
                     "heightCm": 170.0,
                     "dailyCalorieGoal": 1800,
                 })
-            if "/api/meal-logs/internal/today-calories" in url:
+            if "/api/v1/meal-logs/internal/today-calories" in url:
                 # meal-service returns raw JSON number (BigDecimal), not a dict
                 return Response(200, json=650.5)
             if "/api/v1/nutrition/meal-logs" in url:
