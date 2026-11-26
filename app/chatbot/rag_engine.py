@@ -133,13 +133,20 @@ class ChatbotRAGEngine:
                     )
                     if c_resp.status_code == 200:
                         c_data = c_resp.json()
-                        consumed = float(c_data.get("consumedCalories", 0.0))
+                        if isinstance(c_data, (int, float)):
+                            consumed = float(c_data)
+                        elif isinstance(c_data, str):
+                            consumed = float(c_data)
+                        elif isinstance(c_data, dict):
+                            consumed = float(c_data.get("consumedCalories", c_data.get("totalKcal", 0.0)))
+                        else:
+                            consumed = 0.0
                         context["todayConsumedKcal"] = consumed
                         context["remainingKcalToday"] = max(0.0, context["dailyCalorieGoal"] - consumed)
 
                     m_resp = await client.get(
                         f"{mh}/api/v1/nutrition/meal-logs",
-                        params={"username": username, "limit": 5},
+                        params={"username": username, "page": 0, "size": 5},
                         headers=user_headers
                     )
                     if m_resp.status_code == 200:
@@ -148,8 +155,8 @@ class ChatbotRAGEngine:
                             context["todayMeals"] = [
                                 {
                                     "mealType": m.get("mealType"),
-                                    "dishName": m.get("notes") or m.get("foodName") or "Món ăn",
-                                    "calories": m.get("totalCalories", 0)
+                                    "dishName": m.get("foodName") or m.get("userNotes") or m.get("notes") or "Món ăn",
+                                    "calories": float(m.get("totalKcal", m.get("totalCalories", 0)) or 0)
                                 }
                                 for m in m_data[:4]
                             ]

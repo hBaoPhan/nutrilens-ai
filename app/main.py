@@ -37,15 +37,14 @@ default_weights = "weights/yolov8_vietfood_seg.pt" if os.path.exists("weights/yo
 weights_path = os.getenv("MODEL_WEIGHTS_PATH", default_weights)
 engine = FoodSegmentationEngine(weights_path=weights_path)
 
-# Brain Artifact directory for Markdown embedding
-ARTIFACT_DIR = r"C:\Users\baoph\.gemini\antigravity\brain\fd8f0d58-fe89-4a9f-a991-bf55be9f40a3\unity_captures"
-
 # Cache last diagnostic info in memory for instant inspection
 last_diagnostic_cache = {}
 
 # Security limits & feature flags
 MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", str(10 * 1024 * 1024)))
 ENABLE_DEBUG_ENDPOINTS = os.getenv("ENABLE_DEBUG_ENDPOINTS", "false").lower() == "true"
+ENABLE_VISION_DEBUG_CAPTURE = os.getenv("ENABLE_VISION_DEBUG_CAPTURE", "false").lower() == "true"
+MAX_DEBUG_CAPTURES = int(os.getenv("MAX_DEBUG_CAPTURES", "30"))
 
 
 def _require_debug_endpoints_enabled():
@@ -67,22 +66,12 @@ def _require_authenticated_user(x_user_username: Optional[str]) -> str:
 
 def get_debug_capture_dirs() -> List[str]:
     """
-    Returns all valid target directories for saving debug captures.
-    Guarantees saving to both root debug_captures and ai-service/debug_captures
-    whether running inside Docker or directly on the host machine.
+    Returns valid target directories for saving debug captures when debug capture is enabled.
     """
-    base_dir = os.path.dirname(os.path.abspath(__file__))  # /app/app or .../ai-service/app
+    base_dir = os.path.dirname(os.path.abspath(__file__))
     candidates = [
-        # Inside Docker mount points
         "/app/debug_captures",
-        "/app/ai_debug_captures",
-        # Local development relative paths
-        os.path.abspath("debug_captures"),
-        os.path.abspath("ai-service/debug_captures"),
         os.path.abspath(os.path.join(base_dir, "..", "debug_captures")),
-        os.path.abspath(os.path.join(base_dir, "..", "..", "debug_captures")),
-        # Conversation Artifact directory
-        ARTIFACT_DIR
     ]
     valid_dirs = []
     seen = set()
@@ -98,8 +87,26 @@ def get_debug_capture_dirs() -> List[str]:
     return valid_dirs
 
 
+def _prune_old_captures(directory: str, prefix: str):
+    """Keeps at most MAX_DEBUG_CAPTURES timestamped files per prefix to prevent unbounded disk growth."""
+    try:
+        files = sorted(
+            [f for f in os.listdir(directory) if f.startswith(prefix) and f.endswith(".jpg")]
+        )
+        excess = len(files) - MAX_DEBUG_CAPTURES
+        for old_file in files[:max(0, excess)]:
+            try:
+                os.remove(os.path.join(directory, old_file))
+            except OSError:
+                pass
+    except OSError:
+        pass
+
+
 def save_raw_debug_captures(content: bytes, timestamp_str: str) -> List[str]:
-    """Saves raw incoming JPEG bytes to all debug directories."""
+    """Saves raw incoming JPEG bytes when ENABLE_VISION_DEBUG_CAPTURE is enabled."""
+    if not ENABLE_VISION_DEBUG_CAPTURE:
+        return []
     saved_paths = []
     for d in get_debug_capture_dirs():
         p_ts = os.path.join(d, f"capture_{timestamp_str}.jpg")
@@ -111,6 +118,7 @@ def save_raw_debug_captures(content: bytes, timestamp_str: str) -> List[str]:
                 saved_paths.append(p)
             except Exception as e:
                 logger.debug(f"Failed to write raw capture to {p}: {e}")
+        _prune_old_captures(d, "capture_")
     return saved_paths
 
 
@@ -194,7 +202,9 @@ def draw_prediction_overlay(cv_img, all_detected, conf_threshold: float):
 
 
 def save_prediction_debug_captures(annotated_img, timestamp_str: str) -> List[str]:
-    """Encodes and saves annotated prediction image to all debug directories."""
+    """Encodes and saves annotated prediction image when ENABLE_VISION_DEBUG_CAPTURE is enabled."""
+    if not ENABLE_VISION_DEBUG_CAPTURE:
+        return []
     import cv2
     saved_paths = []
     for d in get_debug_capture_dirs():
@@ -206,6 +216,7 @@ def save_prediction_debug_captures(annotated_img, timestamp_str: str) -> List[st
                 saved_paths.append(p)
             except Exception as e:
                 logger.debug(f"Failed to write prediction image to {p}: {e}")
+        _prune_old_captures(d, "pred_")
     return saved_paths
 
 
@@ -291,78 +302,42 @@ async def segment_food(
     if saved_raw:
         logger.info(f"💾 Raw capture saved ({size_kb:.1f} KB): {os.path.basename(saved_raw[0])} -> {len(saved_raw)} locations")
 
-    # 2. RUN IN-DEPTH COMPUTER VISION DIAGNOSTIC ON CAPTURED FRAME
+    # 2. RUN IN-DEPTH COMPUTER VISION DIAGNOSTIC ONLY WHEN EXPLICITLY ENABLED
     cv_img = None
-    try:
-        import cv2
-        import numpy as np
+    if ENABLE_VISION_DEBUG_CAPTURE:
+        try:
+            import cv2
+            import numpy as np
 
-        nparr = np.frombuffer(content, np.uint8)
-        cv_img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+            nparr = np.frombuffer(content, np.uint8)
+            cv_img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
 
-        if cv_img is not None:
-            img_h, img_w = cv_img.shape[:2]
-            aspect_ratio = img_w / float(img_h)
-            orientation_type = "Landscape" if aspect_ratio > 1.05 else ("Portrait" if aspect_ratio < 0.95 else "Square")
+            if cv_img is not None:
+                img_h, img_w = cv_img.shape[:2]
+                aspect_ratio = img_w / float(img_h)
+                orientation_type = "Landscape" if aspect_ratio > 1.05 else ("Portrait" if aspect_ratio < 0.95 else "Square")
 
-            # Sharpness / Blur analysis (Laplacian Variance)
-            gray = cv2.cvtColor(cv_img, cv2.COLOR_BGR2GRAY)
-            laplacian_var = float(cv2.Laplacian(gray, cv2.CV_64F).var())
-            blur_status = "CRITICAL_BLUR" if laplacian_var < 35 else ("MILD_BLUR" if laplacian_var < 90 else "SHARP")
+                gray = cv2.cvtColor(cv_img, cv2.COLOR_BGR2GRAY)
+                laplacian_var = float(cv2.Laplacian(gray, cv2.CV_64F).var())
+                blur_status = "CRITICAL_BLUR" if laplacian_var < 35 else ("MILD_BLUR" if laplacian_var < 90 else "SHARP")
 
-            # Brightness & Contrast analysis
-            mean_brightness = float(np.mean(gray))
-            contrast_std = float(np.std(gray))
-            lighting_status = "TOO_DARK" if mean_brightness < 50 else ("TOO_BRIGHT" if mean_brightness > 215 else "NORMAL")
+                mean_brightness = float(np.mean(gray))
+                contrast_std = float(np.std(gray))
+                lighting_status = "TOO_DARK" if mean_brightness < 50 else ("TOO_BRIGHT" if mean_brightness > 215 else "NORMAL")
 
-            # Color balance (BGR mean)
-            mean_b, mean_g, mean_r = [float(v) for v in np.mean(cv_img, axis=(0, 1))]
-
-            logger.info("═════════════════════════════════════════════════════════════════════")
-            logger.info(f"🔬 CAMERA FRAME DIAGNOSTIC | Dim: {img_w}x{img_h} ({orientation_type}, aspect: {aspect_ratio:.2f})")
-            logger.info(f"   • Blur Score (Laplacian Var): {laplacian_var:.1f} [{blur_status}]")
-            logger.info(f"   • Brightness: {mean_brightness:.1f}/255 [{lighting_status}] | Contrast Std: {contrast_std:.1f}")
-            logger.info(f"   • Channels Mean -> B: {mean_b:.1f}, G: {mean_g:.1f}, R: {mean_r:.1f}")
-
-            # Test all 4 angles with YOLO to identify if orientation was wrong
-            if engine.model is not None:
-                angle_tests = {}
-                test_angles = [
-                    ("0_DEG", cv_img),
-                    ("90_DEG_CW", cv2.rotate(cv_img, cv2.ROTATE_90_CLOCKWISE)),
-                    ("180_DEG", cv2.rotate(cv_img, cv2.ROTATE_180)),
-                    ("270_DEG_CW", cv2.rotate(cv_img, cv2.ROTATE_90_COUNTERCLOCKWISE)),
-                    ("FLIP_V", cv2.flip(cv_img, 0))
-                ]
-                for aname, aimg in test_angles:
-                    ares = engine.model(aimg, conf=0.005, verbose=False)[0]
-                    atop = []
-                    if ares.boxes is not None and len(ares.boxes) > 0:
-                        for b in ares.boxes[:3]:
-                            cname = engine.model.names[int(b.cls[0])]
-                            cconf = float(b.conf[0])
-                            atop.append(f"{cname} ({cconf*100:.1f}%)")
-                    angle_tests[aname] = atop or ["None"]
-
-                logger.info("   • Multi-Angle Predictions:")
-                for aname, atop in angle_tests.items():
-                    logger.info(f"     └─ {aname:<12}: {', '.join(atop)}")
-            logger.info("═════════════════════════════════════════════════════════════════════")
-
-            last_diagnostic_cache.update({
-                "timestamp": timestamp_str,
-                "resolution": f"{img_w}x{img_h}",
-                "aspectRatio": round(aspect_ratio, 2),
-                "orientation": orientation_type,
-                "blurScore": round(laplacian_var, 1),
-                "blurStatus": blur_status,
-                "brightness": round(mean_brightness, 1),
-                "lightingStatus": lighting_status,
-                "contrast": round(contrast_std, 1),
-                "angleTests": angle_tests if engine.model is not None else {}
-            })
-    except Exception as diag_ex:
-        logger.warning(f"Diagnostic error: {diag_ex}")
+                last_diagnostic_cache.update({
+                    "timestamp": timestamp_str,
+                    "resolution": f"{img_w}x{img_h}",
+                    "aspectRatio": round(aspect_ratio, 2),
+                    "orientation": orientation_type,
+                    "blurScore": round(laplacian_var, 1),
+                    "blurStatus": blur_status,
+                    "brightness": round(mean_brightness, 1),
+                    "lightingStatus": lighting_status,
+                    "contrast": round(contrast_std, 1),
+                })
+        except Exception as diag_ex:
+            logger.warning(f"Diagnostic error: {diag_ex}")
 
     # 3. PERFORM STANDARD SEGMENTATION & INFERENCE
     default_conf_thresh = float(os.getenv("YOLO_CONF_THRESHOLD", "0.40"))
