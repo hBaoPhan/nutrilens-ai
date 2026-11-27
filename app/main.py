@@ -1,6 +1,7 @@
 # ai-service/app/main.py
 import os
 import time
+import asyncio
 import logging
 from datetime import datetime
 from typing import Optional, List
@@ -343,16 +344,20 @@ async def segment_food(
         except Exception as diag_ex:
             logger.warning(f"Diagnostic error: {diag_ex}")
 
-    # 3. PERFORM STANDARD SEGMENTATION & INFERENCE
+    # 3. PERFORM OPTIMIZED NON-BLOCKING SEGMENTATION INFERENCE
     default_conf_thresh = float(os.getenv("YOLO_CONF_THRESHOLD", "0.40"))
     effective_conf_thresh = min_conf if min_conf is not None else default_conf_thresh
-    scan_min_conf = float(os.getenv("YOLO_SCAN_MIN_CONF", "0.01"))
+    # Only scan below conf_threshold when diagnostic include_all=True (default min 0.20 instead of 0.01 noise)
+    diagnostic_min_conf = float(os.getenv("YOLO_SCAN_MIN_CONF", "0.20"))
+    effective_scan_conf = diagnostic_min_conf if include_all else effective_conf_thresh
 
-    qualified_items, all_detected = engine.segment_image_bytes(
+    qualified_items, all_detected = await asyncio.to_thread(
+        engine.segment_image_bytes,
         content,
         conf_threshold=effective_conf_thresh,
-        scan_min_conf=scan_min_conf,
-        auto_orient=True
+        scan_min_conf=effective_scan_conf,
+        auto_orient=True,
+        decoded_img=cv_img,
     )
     inference_ms = (time.time() - start_time) * 1000.0
 
@@ -361,7 +366,7 @@ async def segment_food(
     if len(all_detected) == 0:
         logger.info(
             f"🔍 Scan Result ({size_kb:.1f} KB | {inference_ms:.1f}ms): "
-            f"0 objects detected by YOLO model across all orientations"
+            f"0 objects detected by YOLO model"
         )
     else:
         logger.info(
@@ -403,7 +408,7 @@ async def segment_food(
         totalComponentsDetected=len(output_items),
         itemCounts=item_counts,
         items=output_items,
-        allDetected=all_detected
+        allDetected=all_detected if include_all else None
     )
 
 
