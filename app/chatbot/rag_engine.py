@@ -249,6 +249,8 @@ class ChatbotRAGEngine:
             "dailyCalorieGoal": 2000,
             "todayConsumedKcal": 0.0,
             "remainingKcalToday": 2000.0,
+            "todayWaterMl": 0,
+            "dailyWaterGoalMl": 2300,
             "todayMeals": []
         }
 
@@ -322,6 +324,17 @@ class ChatbotRAGEngine:
                                 }
                                 for m in m_data[:4]
                             ]
+
+                    w_resp = await client.get(
+                        f"{mh}/api/v1/water-logs/internal/today",
+                        params={"username": username},
+                        headers=internal_headers
+                    )
+                    if w_resp.status_code == 200:
+                        w_data = w_resp.json()
+                        if isinstance(w_data, dict):
+                            context["todayWaterMl"] = int(w_data.get("amountMl", 0) or 0)
+                            context["dailyWaterGoalMl"] = int(w_data.get("goalMl", context["dailyWaterGoalMl"]) or context["dailyWaterGoalMl"])
                     break
                 except Exception:
                     continue
@@ -467,6 +480,7 @@ class ChatbotRAGEngine:
             f"- Thể trạng: {user_ctx['weightKg']} kg | {user_ctx['heightCm']} cm\n"
             f"- Chỉ tiêu năng lượng mỗi ngày (TDEE): {user_ctx['dailyCalorieGoal']} kcal\n"
             f"- Đã nạp hôm nay: {user_ctx['todayConsumedKcal']:.0f} kcal | Còn lại: {user_ctx['remainingKcalToday']:.0f} kcal\n"
+            f"- Lượng nước đã uống hôm nay: {user_ctx.get('todayWaterMl', 0)} / {user_ctx.get('dailyWaterGoalMl', 2300)} ml\n"
             f"- Các bữa đã ăn hôm nay: {today_meals_summary}\n\n"
             f"=== DỮ LIỆU TRI THỨC ĐÃ TRUY XUẤT (GROUNDED KNOWLEDGE BASE) ===\n"
             f"{grounded_knowledge_text}\n\n"

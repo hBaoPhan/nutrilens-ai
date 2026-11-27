@@ -103,6 +103,8 @@ async def test_rag_fetch_personal_context_parses_raw_float_and_total_kcal(monkey
                     {"mealType": "BREAKFAST", "foodName": "Bánh Mì Thịt Nướng", "totalKcal": 450.5},
                     {"mealType": "SNACK", "foodName": "Trứng Luộc", "totalKcal": 200.0},
                 ])
+            if "/api/v1/water-logs/internal/today" in url:
+                return Response(200, json={"amountMl": 1250, "goalMl": 2250, "percentage": 56})
             return Response(404)
 
     monkeypatch.setattr("app.chatbot.rag_engine.httpx.AsyncClient", MockAsyncClient)
@@ -112,6 +114,8 @@ async def test_rag_fetch_personal_context_parses_raw_float_and_total_kcal(monkey
     assert ctx["dailyCalorieGoal"] == 1800
     assert ctx["todayConsumedKcal"] == pytest.approx(650.5)
     assert ctx["remainingKcalToday"] == pytest.approx(1149.5)
+    assert ctx["todayWaterMl"] == 1250
+    assert ctx["dailyWaterGoalMl"] == 2250
     assert len(ctx["todayMeals"]) == 2
     assert ctx["todayMeals"][0]["dishName"] == "Bánh Mì Thịt Nướng"
     assert ctx["todayMeals"][0]["calories"] == pytest.approx(450.5)
