@@ -260,3 +260,52 @@ def test_input_and_output_guardrails_block_off_topic_injection_and_leaks():
     assert "AQ.Ab8" not in leaked
     leaked_prompt = sanitize_output_guardrails("=== NGUYÊN TẮC CỐT LÕI === ...")
     assert "NGUYÊN TẮC CỐT LÕI" not in leaked_prompt
+
+
+@pytest.mark.anyio
+async def test_fetch_personal_context_filters_strictly_to_today_vn(monkeypatch):
+    from datetime import datetime, timezone, timedelta
+
+    today_vn = datetime.now(timezone(timedelta(hours=7))).strftime("%Y-%m-%d")
+    engine = ChatbotRAGEngine()
+    captured_meal_params = {}
+
+    class MockAsyncClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def get(self, url, params=None, headers=None):
+            if "/api/v1/auth/internal/users/" in url:
+                return Response(200, json={
+                    "fitnessGoal": "MAINTAIN",
+                    "weightKg": 65.0,
+                    "heightCm": 170.0,
+                    "dailyCalorieGoal": 2100,
+                })
+            if "/api/v1/meal-logs/internal/today-calories" in url:
+                return Response(200, json=0)
+            if "/api/v1/nutrition/meal-logs" in url:
+                captured_meal_params.update(params or {})
+                # Simulate an old-day meal accidentally returned -> must be filtered out defensively
+                return Response(200, json=[
+                    {"mealType": "DINNER", "foodName": "Phở Bò", "totalKcal": 500.0, "loggedAt": "2026-11-26T18:30:00"},
+                    {"mealType": "LUNCH", "foodName": "Cơm Tấm", "totalKcal": 700.0, "loggedAt": "2026-11-26T12:00:00"},
+                ])
+            if "/api/v1/water-logs/internal/today" in url:
+                return Response(200, json={"amountMl": 0, "goalMl": 2300})
+            return Response(404)
+
+    monkeypatch.setattr("app.chatbot.rag_engine.httpx.AsyncClient", MockAsyncClient)
+
+    ctx = await engine.fetch_personal_context("admin")
+    assert captured_meal_params.get("date") == today_vn
+    assert ctx["todayDate"] == today_vn
+    assert ctx["todayConsumedKcal"] == pytest.approx(0.0)
+    assert ctx["remainingKcalToday"] == pytest.approx(2100.0)
+    assert ctx["todayMeals"] == []
