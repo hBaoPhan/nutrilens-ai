@@ -11,6 +11,8 @@ env/
 
 # YOLO training datasets & runs
 dataset/
+dataset_balanced/
+_tmp_rebalance_src/
 runs/
 
 # Model weights & checkpoints

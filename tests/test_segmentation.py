@@ -122,6 +122,65 @@ def test_auto_orientation_early_exits_and_clean_food_mapping():
     assert len(all_items) == 1
 
 
+def test_per_class_confidence_calibration_and_balanced_weights():
+    from collections import Counter
+    from rebalance_dataset import compute_class_weights
+    from train_vietfood_seg import compute_dataset_class_and_sample_weights
+
+    # 1. Per-class confidence calibration in FoodSegmentationEngine
+    test_engine = object.__new__(FoodSegmentationEngine)
+    test_engine.weights_path = "mock.pt"
+    test_engine.atomic_conf_threshold = 0.30
+    test_engine.class_thresholds = {"CHAO_LONG": 0.50}
+
+    assert test_engine.get_class_threshold("BOILED_EGG", 0.40) == pytest.approx(0.30)
+    assert test_engine.get_class_threshold("APPLE", 0.40) == pytest.approx(0.30)
+    assert test_engine.get_class_threshold("PHO_BO", 0.40) == pytest.approx(0.40)
+    assert test_engine.get_class_threshold("CHAO_LONG", 0.40) == pytest.approx(0.50)
+
+    class FakeBox:
+        def __init__(self, cls_id, conf):
+            self.cls = [cls_id]
+            self.conf = [conf]
+            self.xyxy = [np.array([10.0, 10.0, 50.0, 50.0])]
+
+    class FakeResult:
+        def __init__(self, boxes):
+            self.boxes = boxes
+            self.masks = None
+
+    class FakeModel:
+        names = {0: "CHAO_LONG", 1: "BOILED_EGG"}
+
+        def __call__(self, img, conf=0.3, verbose=False):
+            # Both detected at 0.34 -> BOILED_EGG qualifies (>=0.30), CHAO_LONG rejected (<0.50)
+            return [FakeResult([FakeBox(0, 0.34), FakeBox(1, 0.34)])]
+
+    test_engine.model = FakeModel()
+    dummy_img = np.zeros((100, 100, 3), dtype=np.uint8)
+    qual, _ = test_engine.segment_image_bytes(b"", conf_threshold=0.40, auto_orient=False, decoded_img=dummy_img)
+    assert len(qual) == 1
+    assert qual[0].foodCode == "BOILED_EGG"
+
+    # 2. Smoothed inverse-frequency class weights & WeightedRandomSampler image weights
+    w = compute_class_weights(Counter({0: 20, 7: 400, 14: 100}), num_classes=30)
+    assert w[0] > w[14] > w[7]
+    assert w[29] == 1.0  # Inactive class defaults safely to 1.0
+
+    class DummyDataset:
+        labels = [
+            {"cls": np.array([[7]])},
+            {"cls": np.array([[7]])},
+            {"cls": np.array([[7]])},
+            {"cls": np.array([[7]])},
+            {"cls": np.array([[0]])},
+        ]
+
+    cls_w, sample_w = compute_dataset_class_and_sample_weights(DummyDataset(), num_classes=30)
+    assert cls_w[0] > cls_w[7]
+    assert sample_w[4] > sample_w[0]
+
+
 @pytest.mark.anyio
 async def test_segment_food_invalid_mime_type():
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:

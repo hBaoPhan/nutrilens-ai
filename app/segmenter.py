@@ -1,10 +1,31 @@
 # ai-service/app/segmenter.py
 import os
+import json
 import logging
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 from app.schemas import SegmentedFoodItem
 
 logger = logging.getLogger("nutrilens-ai")
+
+# Atomic ingredients & fruit/yogurt classes (smaller objects -> lower calibrated confidence threshold)
+ATOMIC_AND_FRUIT_CODES = frozenset({
+    "BOILED_EGG",
+    "CARROT",
+    "CHICKEN_BREAST",
+    "BROCCOLI",
+    "CUCUMBER",
+    "SWEET_POTATO",
+    "TOFU_STEAMED",
+    "SHRIMP_BOILED",
+    "RICE_WHITE",
+    "PORK_GRILLED",
+    "ORANGE",
+    "BANANA",
+    "APPLE",
+    "COCONUT",
+    "SUA_CHUA",
+    "WATERMELON",
+})
 
 # Standardized mapping from YOLO class labels to canonical NutriLens food codes
 FOOD_MAPPING = {
@@ -90,7 +111,52 @@ class FoodSegmentationEngine:
     def __init__(self, weights_path: Optional[str] = None):
         self.weights_path = weights_path
         self.model = None
+        self.atomic_conf_threshold = float(os.getenv("YOLO_ATOMIC_CONF_THRESHOLD", "0.30"))
+        self.class_thresholds: Dict[str, float] = self._load_class_thresholds()
         self._load_model()
+
+    @staticmethod
+    def _load_class_thresholds() -> Dict[str, float]:
+        """Loads optional per-class confidence overrides from YOLO_CLASS_THRESHOLDS JSON env var."""
+        raw = os.getenv("YOLO_CLASS_THRESHOLDS", "").strip()
+        if not raw:
+            return {}
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict):
+                return {
+                    str(k).strip().upper(): max(0.05, min(0.99, float(v)))
+                    for k, v in parsed.items()
+                }
+        except Exception as ex:
+            logger.warning(f"Invalid YOLO_CLASS_THRESHOLDS JSON ignored: {ex}")
+        return {}
+
+    def get_class_threshold(self, food_code: str, default_threshold: float) -> float:
+        """
+        Returns calibrated confidence threshold for a given food class:
+        1. Explicit per-class override in YOLO_CLASS_THRESHOLDS (if configured)
+        2. Calibrated lower threshold (default 0.30) for smaller/minority atomic & fruit classes
+        3. Standard threshold (default 0.40) for composite Vietnamese dishes
+        """
+        code = (food_code or "").strip().upper()
+        overrides = getattr(self, "class_thresholds", None) or {}
+        if code in overrides:
+            return overrides[code]
+        if code in ATOMIC_AND_FRUIT_CODES:
+            atomic_thresh = getattr(self, "atomic_conf_threshold", 0.30)
+            return min(default_threshold, atomic_thresh)
+        return default_threshold
+
+    def _effective_floor_conf(self, default_threshold: float, scan_min_conf: Optional[float]) -> float:
+        atomic_thresh = getattr(self, "atomic_conf_threshold", 0.30)
+        overrides = getattr(self, "class_thresholds", None) or {}
+        candidates = [default_threshold, min(default_threshold, atomic_thresh)]
+        if overrides:
+            candidates.append(min(overrides.values()))
+        if scan_min_conf is not None:
+            candidates.append(scan_min_conf)
+        return max(0.05, min(candidates))
 
     def _load_model(self):
         try:
@@ -141,12 +207,15 @@ class FoodSegmentationEngine:
                     return [], []
 
             orig_h, orig_w = img.shape[:2]
-            effective_scan_conf = conf_threshold if scan_min_conf is None else min(scan_min_conf, conf_threshold)
+            effective_scan_conf = self._effective_floor_conf(conf_threshold, scan_min_conf)
 
             # 1. Primary pass at 0° orientation
             results = self.model(img, conf=effective_scan_conf, verbose=False)[0]
             all_detected = self._extract_items_from_results(results, orig_w, orig_h)
-            qualified_items = [it for it in all_detected if it.confidence >= conf_threshold]
+            qualified_items = [
+                it for it in all_detected
+                if it.confidence >= self.get_class_threshold(it.foodCode, conf_threshold)
+            ]
 
             # 2. Fast Orientation Recovery with Early Exit (only if 0° found nothing qualified)
             if len(qualified_items) == 0 and auto_orient:
@@ -155,17 +224,21 @@ class FoodSegmentationEngine:
                     ("rot_270", cv2.ROTATE_90_COUNTERCLOCKWISE),
                     ("rot_180", cv2.ROTATE_180),
                 )
+                rot_floor_conf = self._effective_floor_conf(conf_threshold, None)
 
                 for name, rot_code in orientations:
                     rot_img = cv2.rotate(img, rot_code)
                     rot_h, rot_w = rot_img.shape[:2]
-                    # Filter directly at conf_threshold during recovery to avoid wasting CPU on noise masks
-                    rot_res = self.model(rot_img, conf=conf_threshold, verbose=False)[0]
+                    # Filter directly at calibrated floor during recovery to avoid wasting CPU on noise masks
+                    rot_res = self.model(rot_img, conf=rot_floor_conf, verbose=False)[0]
                     rot_raw_items = self._extract_items_from_results(rot_res, rot_w, rot_h)
 
                     if rot_raw_items:
                         mapped_items = self._remap_items_to_original(rot_raw_items, name, orig_w, orig_h)
-                        rot_qual = [it for it in mapped_items if it.confidence >= conf_threshold]
+                        rot_qual = [
+                            it for it in mapped_items
+                            if it.confidence >= self.get_class_threshold(it.foodCode, conf_threshold)
+                        ]
                         if rot_qual:
                             logger.info(
                                 f"🔄 Auto-Orientation Applied: Recovered {len(rot_qual)} item(s) via {name} (early exit)"
