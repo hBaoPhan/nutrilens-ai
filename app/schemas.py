@@ -122,5 +122,8 @@ class ChatHistoryItem(BaseModel):
 class ChatHistoryResponse(BaseModel):
     conversationId: str
     username: str
+    totalMessages: int = 0
+    hasSummary: bool = False
+    summary: str = ""
     messages: List[ChatHistoryItem]
 

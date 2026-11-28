@@ -39,7 +39,7 @@ AUTH_SERVICE_URL = os.getenv("AUTH_SERVICE_URL", "http://auth-service:8081")
 MEAL_SERVICE_URL = os.getenv("MEAL_SERVICE_URL", "http://meal-service:8083")
 INTERNAL_SERVICE_SECRET = os.getenv("INTERNAL_SERVICE_SECRET", "")
 REDIS_URL = os.getenv("REDIS_URL", "")
-_CONVERSATION_TTL_SECONDS = int(os.getenv("CHAT_MEMORY_TTL_SECONDS", "86400"))
+_CONVERSATION_TTL_SECONDS = int(os.getenv("CHAT_MEMORY_TTL_SECONDS", "604800"))  # 7 days default persistence
 
 # Gemini LLM failover & circuit-breaker configuration
 DEFAULT_CHAT_MODELS: List[str] = [
@@ -55,10 +55,14 @@ GEMINI_TOTAL_TIMEOUT_SECONDS = float(os.getenv("GEMINI_TOTAL_TIMEOUT_SECONDS", "
 MODEL_TRANSIENT_COOLDOWN_SECONDS = float(os.getenv("GEMINI_MODEL_COOLDOWN_SECONDS", "60.0"))
 MODEL_PERMANENT_COOLDOWN_SECONDS = float(os.getenv("GEMINI_MODEL_INVALID_COOLDOWN_SECONDS", "600.0"))
 
-# Bounded LRU fallback memory when Redis is unavailable: {conversation_id: {"owner": str, "messages": [...]}}
+# Bounded LRU fallback memory when Redis is unavailable: {conversation_id: {"owner": str, "summary": str, "messages": [...]}}
 _CONVERSATION_MEMORY: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
 _MAX_IN_MEMORY_CONVERSATIONS = 500
-_MAX_HISTORY_TURNS = 10
+_MAX_STORED_MESSAGES = 60          # Up to 30 turns retained in Redis for UI display
+_LLM_WINDOW_MAX_MESSAGES = 8       # Up to 4 recent turns sent verbatim to Gemini
+_LLM_WINDOW_MAX_CHARS = 3600       # Strict char/token budget for verbatim LLM history
+_LLM_SINGLE_MSG_MAX_CHARS = 700    # Cap individual historical message length in prompt
+_MAX_SUMMARY_CHARS = 800           # Rolling compressed summary of older turns
 
 
 _GOAL_LABELS_VN: Dict[str, str] = {
@@ -445,21 +449,108 @@ class ChatbotRAGEngine:
         if not username or owner.lower() != username.strip().lower():
             raise PermissionError("Forbidden: You do not have access to this conversation")
 
+    @staticmethod
+    def _compress_messages_into_summary(existing_summary: str, evicted_messages: List[Dict[str, str]]) -> str:
+        """
+        Deterministically condenses older evicted turns into a compact rolling summary
+        (zero extra LLM latency/cost) bounded strictly to _MAX_SUMMARY_CHARS.
+        """
+        lines = [ln.strip() for ln in (existing_summary or "").split("\n") if ln.strip()]
+        for msg in evicted_messages:
+            role = msg.get("role", "user")
+            raw = _strip_markdown(msg.get("content", "")).replace("\n", " ").strip()
+            if not raw:
+                continue
+            snippet = raw[:110] + ("..." if len(raw) > 110 else "")
+            prefix = "Người dùng hỏi/chia sẻ: " if role == "user" else "AI đã tư vấn: "
+            lines.append(f"- {prefix}{snippet}")
+
+        # Keep the most recent summary lines within strict char budget
+        kept: List[str] = []
+        total_len = 0
+        for ln in reversed(lines):
+            added = len(ln) + (1 if kept else 0)
+            if total_len + added > _MAX_SUMMARY_CHARS:
+                break
+            kept.append(ln)
+            total_len += added
+        kept.reverse()
+        return "\n".join(kept)
+
+    @staticmethod
+    def _build_llm_history_window(history: List[Dict[str, str]]) -> Tuple[List[Dict[str, str]], List[Dict[str, str]]]:
+        """
+        Splits conversation history into (overflow_for_summary, active_llm_window)
+        enforcing both message-count and character/token budgets so prompt size stays O(1).
+        """
+        if not history:
+            return [], []
+
+        selected_rev: List[Dict[str, str]] = []
+        total_chars = 0
+        cutoff_idx = len(history)
+
+        for idx in range(len(history) - 1, -1, -1):
+            if len(selected_rev) >= _LLM_WINDOW_MAX_MESSAGES:
+                break
+            msg = history[idx]
+            text = (msg.get("content") or "").strip()
+            if len(text) > _LLM_SINGLE_MSG_MAX_CHARS:
+                text = text[:_LLM_SINGLE_MSG_MAX_CHARS].rstrip() + "..."
+            if total_chars + len(text) > _LLM_WINDOW_MAX_CHARS and selected_rev:
+                break
+            selected_rev.append({"role": msg.get("role", "user"), "content": text})
+            total_chars += len(text)
+            cutoff_idx = idx
+
+        selected_rev.reverse()
+        overflow = history[:cutoff_idx]
+        return overflow, selected_rev
+
     def get_conversation_history(
         self,
         conversation_id: str,
         username: Optional[str] = None,
-        user_role: Optional[str] = None
+        user_role: Optional[str] = None,
+        limit: Optional[int] = None
     ) -> List[Dict[str, str]]:
-        """Returns sliding memory history for the given conversation ID."""
+        """Returns persisted conversation history (optionally capped to latest `limit` messages)."""
         if username is not None:
             self.assert_conversation_access(conversation_id, username, user_role)
         record = self._load_conversation_record(conversation_id)
-        return list(record.get("messages", [])) if record else []
+        msgs = list(record.get("messages", [])) if record else []
+        if limit is not None and limit > 0 and len(msgs) > limit:
+            return msgs[-limit:]
+        return msgs
+
+    def get_conversation_metadata(
+        self,
+        conversation_id: str,
+        username: Optional[str] = None,
+        user_role: Optional[str] = None,
+        limit: int = 30
+    ) -> Dict[str, Any]:
+        """Returns bounded messages along with summary & total count metadata for clients."""
+        if username is not None:
+            self.assert_conversation_access(conversation_id, username, user_role)
+        record = self._load_conversation_record(conversation_id) or {}
+        all_msgs = list(record.get("messages", []))
+        summary = (record.get("summary") or "").strip()
+        bounded = all_msgs[-limit:] if limit > 0 and len(all_msgs) > limit else all_msgs
+        return {
+            "messages": bounded,
+            "totalMessages": len(all_msgs),
+            "hasSummary": bool(summary),
+            "summary": summary
+        }
+
+    def get_conversation_summary(self, conversation_id: str) -> str:
+        record = self._load_conversation_record(conversation_id)
+        return (record.get("summary") or "").strip() if record else ""
 
     def append_message_to_history(self, conversation_id: str, role: str, content: str, owner_username: Optional[str] = None):
-        """Appends message and prunes memory to sliding window limit."""
-        record = self._load_conversation_record(conversation_id) or {"owner": None, "messages": []}
+        """Appends message and compresses evicted turns into a bounded rolling summary when history grows long."""
+        record = self._load_conversation_record(conversation_id) or {"owner": None, "summary": "", "messages": []}
         if owner_username and not record.get("owner"):
             record["owner"] = owner_username.strip()
         messages = list(record.get("messages", []))
@@ -468,8 +559,10 @@ class ChatbotRAGEngine:
             "content": content,
             "timestamp": datetime.utcnow().isoformat()
         })
-        if len(messages) > _MAX_HISTORY_TURNS * 2:
-            messages = messages[-_MAX_HISTORY_TURNS * 2:]
+        if len(messages) > _MAX_STORED_MESSAGES:
+            evicted = messages[:-_MAX_STORED_MESSAGES]
+            messages = messages[-_MAX_STORED_MESSAGES:]
+            record["summary"] = self._compress_messages_into_summary(record.get("summary", ""), evicted)
         record["messages"] = messages
         self._save_conversation_record(conversation_id, record)
 
@@ -488,7 +581,8 @@ class ChatbotRAGEngine:
         self,
         user_ctx: Dict[str, Any],
         retrieved_chunks: List[Dict[str, Any]],
-        response_format: str = "markdown"
+        response_format: str = "markdown",
+        conversation_summary: str = ""
     ) -> str:
         """Constructs grounded, natural conversational clinical nutritionist prompt."""
         today_meals_summary = "Chưa ghi nhận bữa ăn nào hôm nay."
@@ -526,6 +620,13 @@ class ChatbotRAGEngine:
 
         today_date = user_ctx.get("todayDate") or datetime.now(timezone(timedelta(hours=7))).strftime("%Y-%m-%d")
 
+        summary_section = ""
+        if conversation_summary and conversation_summary.strip():
+            summary_section = (
+                f"=== TÓM TẮT NGỮ CẢNH HỘI THOẠI TRƯỚC ĐÓ (ĐÃ NÉN LỊCH SỬ DÀI) ===\n"
+                f"{conversation_summary.strip()}\n\n"
+            )
+
         prompt = (
             f"Bạn là trợ lý dinh dưỡng cá nhân NutriLens AI trong ứng dụng AR-NutriLens.\n"
             f"Phong cách: Ấm áp, tự nhiên, thực tế, khoa học, nói thẳng vào trọng tâm như trò chuyện đời thường bằng tiếng Việt.\n\n"
@@ -540,6 +641,7 @@ class ChatbotRAGEngine:
             f"- Bệnh lý nền cần lưu ý: {conditions_vn}\n"
             f"- Dị ứng thực phẩm (TUYỆT ĐỐI TRÁNH): {allergies_vn}\n"
             f"- Các bữa đã ăn hôm nay: {today_meals_summary}\n\n"
+            f"{summary_section}"
             f"=== DỮ LIỆU TRI THỨC ĐÃ TRUY XUẤT (GROUNDED KNOWLEDGE BASE) ===\n"
             f"{grounded_knowledge_text}\n\n"
             f"=== NGUYÊN TẮC CỐT LÕI, PHẠM VI & AN TOÀN Y TẾ (STRICT GUARDRAILS) ===\n"
@@ -618,9 +720,9 @@ class ChatbotRAGEngine:
         if not self.api_key:
             return None, None
 
-        # Build contents array from history + current turn
+        # Build token-budgeted contents array from recent window + current turn
         contents = []
-        for msg in history[-6:]:  # last 3 turns
+        for msg in history:
             role = "user" if msg["role"] == "user" else "model"
             contents.append({"role": role, "parts": [{"text": msg["content"]}]})
         contents.append({"role": "user", "parts": [{"text": query}]})
@@ -742,12 +844,23 @@ class ChatbotRAGEngine:
                             existing_ids.add(guide_id)
                             break
 
-        # 3. Get history and build system prompt
-        history = self.get_conversation_history(cid, username=username, user_role=user_role)
-        system_prompt = self._build_system_prompt(user_ctx, chunks, response_format=normalized_format)
+        # 3. Get history, compress older turns into rolling summary, and enforce token budget
+        full_history = self.get_conversation_history(cid, username=username, user_role=user_role)
+        stored_summary = self.get_conversation_summary(cid)
+        overflow_msgs, llm_history_window = self._build_llm_history_window(full_history)
+        effective_summary = (
+            self._compress_messages_into_summary(stored_summary, overflow_msgs)
+            if overflow_msgs else stored_summary
+        )
+        system_prompt = self._build_system_prompt(
+            user_ctx,
+            chunks,
+            response_format=normalized_format,
+            conversation_summary=effective_summary
+        )
 
-        # 3. Call Gemini LLM or fallback
-        reply, used_model = await self._call_gemini_api(system_prompt, history, query)
+        # 4. Call Gemini LLM or fallback
+        reply, used_model = await self._call_gemini_api(system_prompt, llm_history_window, query)
         model_source = f"GOOGLE_GEMINI ({used_model})" if used_model else "GOOGLE_GEMINI_FLASH"
 
         if reply:

@@ -496,12 +496,18 @@ async def chat_with_bot_stream(
 )
 async def get_chat_history(
     conversationId: str = Query(..., description="Conversation UUID"),
+    limit: int = Query(30, ge=1, le=60, description="Maximum recent messages to return"),
     x_user_username: Optional[str] = Header(None, alias="X-User-Username"),
     x_user_role: Optional[str] = Header(None, alias="X-User-Role")
 ):
     username = _require_authenticated_user(x_user_username)
     try:
-        history = chatbot_engine.get_conversation_history(conversationId, username=username, user_role=x_user_role)
+        meta = chatbot_engine.get_conversation_metadata(
+            conversationId,
+            username=username,
+            user_role=x_user_role,
+            limit=limit
+        )
     except PermissionError as exc:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(exc))
     items = [
@@ -510,11 +516,14 @@ async def get_chat_history(
             content=h["content"],
             timestamp=h["timestamp"]
         )
-        for h in history
+        for h in meta["messages"]
     ]
     return ChatHistoryResponse(
         conversationId=conversationId,
         username=username,
+        totalMessages=meta["totalMessages"],
+        hasSummary=meta["hasSummary"],
+        summary=meta["summary"],
         messages=items
     )
 
